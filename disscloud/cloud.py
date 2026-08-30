@@ -66,6 +66,8 @@ def extract_zip_safe(zip_path: Path, dest: Path) -> None:
             if total > config.MAX_UNZIPPED_BYTES:
                 raise ValueError("展開後サイズが大きすぎます")
         zf.extractall(dest)
+    if zip_path.parent == dest:
+        zip_path.unlink(missing_ok=True)
     _flatten_single_root(dest)
 
 
@@ -86,8 +88,12 @@ class Cloud:
         self.procs: dict[str, asyncio.subprocess.Process] = {}
         self.log_tasks: dict[str, asyncio.Task] = {}
         self.logs: dict[str, list[str]] = {}
-        self._subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
+        self._bot_locks: dict[str, asyncio.Lock] = {}
         store.ensure_dirs()
+
+    def _bot_lock(self, bot_id: str) -> asyncio.Lock:
+        """Return the lock which serializes every mutation of one bot."""
+        return self._bot_locks.setdefault(bot_id, asyncio.Lock())
 
     def subscribe(self, owner_id: str) -> asyncio.Queue[dict[str, Any]]:
         """Subscribe to events for exactly one Discord user."""
@@ -252,41 +258,29 @@ class Cloud:
             raise ValueError("同じ名前のBOTが既にあります")
 
         bot_id = new_id()
-        directory = store.user_bots_dir(owner_id) / bot_id
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "data").mkdir(exist_ok=True)
-        (directory / "public").mkdir(exist_ok=True)
+        async with self._bot_lock(bot_id):
+            return await self._create_locked(
+                bot_id, owner_id=str(owner_id), name=name, source_url=source_url,
+                filename=filename, template=template, language=language,
+            )
 
-        if source_url:
-            dest = directory / (filename or "source.bin")
-            await download(source_url, dest)
-            lower = (filename or "").lower()
-            if lower.endswith(".zip"):
-                extract_zip_safe(dest, directory)
-                dest.unlink(missing_ok=True)
-            else:
-                original = Path(filename or dest.name).name
-                if original in {"source.bin", ""}:
-                    original = "bot"
-                target = directory / original
-                if dest != target:
-                    dest.rename(target)
-        elif template:
-            lang = runtime.normalize_runtime(language)
-            if lang and lang not in (None, "python"):
-                raise ValueError("Python 以外はテンプレートがありません。ソースファイルまたは zip を添付してください")
-            shutil.copy2(TEMPLATES_DIR / "bot.py", directory / "bot.py")
-            shutil.copy2(TEMPLATES_DIR / "requirements.txt", directory / "requirements.txt")
-            public_src = TEMPLATES_DIR / "public"
-            if public_src.exists():
-                for item in public_src.iterdir():
-                    dest_item = directory / "public" / item.name
-                    if item.is_dir():
-                        shutil.copytree(item, dest_item, dirs_exist_ok=True)
-                    else:
-                        shutil.copy2(item, dest_item)
+    async def _create_locked(
+        self, bot_id: str, *, owner_id: str, name: str, source_url: str | None,
+        filename: str | None, template: bool, language: str | None,
+    ) -> dict:
+        parent = store.user_bots_dir(owner_id)
+        directory = parent / bot_id
+        staging = Path(tempfile.mkdtemp(prefix=f".{bot_id}.create-", dir=parent))
+        (staging / "data").mkdir()
+        (staging / "public").mkdir()
 
-        rt, entry = resolve_entry(directory, hint=language)
+        try:
+            await self._populate_source(staging, source_url, filename, template, language)
+            rt, entry = resolve_entry(staging, hint=language)
+            staging.replace(directory)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
         bot = {
             "id": bot_id,
             "name": name,
@@ -301,13 +295,96 @@ class Cloud:
             "siteEnabled": True,
         }
         self.state["bots"][bot_id] = bot
-        self.persist()
-        self._bot_event("bot.created", bot)
-        for file_path in directory.rglob("*"):
-            if file_path.is_file():
-                self.notify_file_change("file.created", bot, str(file_path.relative_to(directory)))
+        try:
+            self.persist()
+        except BaseException:
+            self.state["bots"].pop(bot_id, None)
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
         await self.install(bot)
         return bot
+
+    async def _populate_source(self, directory: Path, source_url: str | None,
+                               filename: str | None, template: bool,
+                               language: str | None) -> None:
+        if source_url:
+            safe_name = Path(filename or "source.bin").name
+            dest = directory / safe_name
+            await download(source_url, dest)
+            if safe_name.lower().endswith(".zip"):
+                extract_zip_safe(dest, directory)
+                dest.unlink(missing_ok=True)
+        elif template:
+            lang = runtime.normalize_runtime(language)
+            if lang and lang != "python":
+                raise ValueError("Python 以外はテンプレートがありません。ソースファイルまたは zip を添付してください")
+            shutil.copy2(TEMPLATES_DIR / "bot.py", directory / "bot.py")
+            shutil.copy2(TEMPLATES_DIR / "requirements.txt", directory / "requirements.txt")
+            if (TEMPLATES_DIR / "public").exists():
+                shutil.copytree(TEMPLATES_DIR / "public", directory / "public", dirs_exist_ok=True)
+
+    async def deploy(self, bot_id: str, *, source_url: str, filename: str | None = None,
+                     language: str | None = None) -> dict:
+        """Atomically replace a bot's source after fully extracting and validating it."""
+        async with self._bot_lock(bot_id):
+            bot = self.state["bots"].get(bot_id)
+            if not bot:
+                raise ValueError("BOTが見つかりません")
+            target = store.bot_dir(bot_id, bot["ownerId"])
+            staging = Path(tempfile.mkdtemp(prefix=f".{bot_id}.deploy-", dir=target.parent))
+            backup = target.with_name(f".{target.name}.backup")
+            try:
+                # Runtime data and secrets survive a source deployment.
+                for name in ("data", ".env", "cloud.log"):
+                    old = target / name
+                    if old.is_dir(): shutil.copytree(old, staging / name)
+                    elif old.exists(): shutil.copy2(old, staging / name)
+                (staging / "public").mkdir(exist_ok=True)
+                await self._populate_source(staging, source_url, filename, False, language)
+                rt, entry = resolve_entry(staging, hint=language)
+                backup.unlink(missing_ok=True) if backup.is_file() else shutil.rmtree(backup, ignore_errors=True)
+                target.replace(backup)
+                try:
+                    staging.replace(target)
+                except BaseException:
+                    backup.replace(target)
+                    raise
+                old_runtime, old_entry = bot.get("runtime"), bot.get("entry")
+                bot["runtime"], bot["entry"] = rt, entry
+                try:
+                    self.persist()
+                except BaseException:
+                    bot["runtime"], bot["entry"] = old_runtime, old_entry
+                    shutil.rmtree(target, ignore_errors=True)
+                    backup.replace(target)
+                    raise
+                shutil.rmtree(backup, ignore_errors=True)
+                return bot
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+
+    async def update_web(self, bot_id: str, *, source_url: str, filename: str | None = None) -> dict:
+        """Atomically update public files without exposing a partial extraction."""
+        async with self._bot_lock(bot_id):
+            bot = self.state["bots"].get(bot_id)
+            if not bot:
+                raise ValueError("BOTが見つかりません")
+            root = store.bot_dir(bot_id, bot["ownerId"])
+            public = root / "public"
+            staging = Path(tempfile.mkdtemp(prefix=".public.update-", dir=root))
+            try:
+                await self._populate_source(staging, source_url, filename, False, None)
+                backup = root / ".public.backup"
+                shutil.rmtree(backup, ignore_errors=True)
+                if public.exists(): public.replace(backup)
+                try: staging.replace(public)
+                except BaseException:
+                    if backup.exists(): backup.replace(public)
+                    raise
+                shutil.rmtree(backup, ignore_errors=True)
+                return bot
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
 
     async def run_cmd(self, args: list[str], cwd: Path) -> str:
         return await runtime.run_cmd(args, cwd)
@@ -366,6 +443,10 @@ class Cloud:
             self.push_log(bot_id, line.decode("utf-8", errors="replace"))
 
     async def start(self, bot_id: str) -> dict:
+        async with self._bot_lock(bot_id):
+            return await self._start_locked(bot_id)
+
+    async def _start_locked(self, bot_id: str) -> dict:
         bot = self.state["bots"].get(bot_id)
         if not bot:
             raise ValueError("BOTが見つかりません")
@@ -431,6 +512,9 @@ class Cloud:
 
     async def _watch_process(self, bot_id: str, proc: asyncio.subprocess.Process) -> None:
         code = await proc.wait()
+        # A delayed watcher for an old process must never discard its replacement.
+        if self.procs.get(bot_id) is not proc:
+            return
         self.procs.pop(bot_id, None)
         for key in (f"{bot_id}:out", f"{bot_id}:err"):
             task = self.log_tasks.pop(key, None)
@@ -459,6 +543,10 @@ class Cloud:
                     self.push_log(bot_id, f"再起動失敗: {err}")
 
     async def stop(self, bot_id: str, *, restart_later: bool = False) -> dict:
+        async with self._bot_lock(bot_id):
+            return await self._stop_locked(bot_id, restart_later=restart_later)
+
+    async def _stop_locked(self, bot_id: str, *, restart_later: bool = False) -> dict:
         bot = self.state["bots"].get(bot_id)
         if not bot:
             raise ValueError("BOTが見つかりません")
@@ -475,19 +563,26 @@ class Cloud:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
+        if self.procs.get(bot_id) is proc:
+            self.procs.pop(bot_id, None)
         if restart_later:
             bot["status"] = "running"
         return bot
 
     async def restart(self, bot_id: str) -> dict:
-        await self.stop(bot_id, restart_later=True)
-        return await self.start(bot_id)
+        async with self._bot_lock(bot_id):
+            await self._stop_locked(bot_id, restart_later=True)
+            return await self._start_locked(bot_id)
 
     async def remove(self, bot_id: str) -> None:
+        async with self._bot_lock(bot_id):
+            await self._remove_locked(bot_id)
+
+    async def _remove_locked(self, bot_id: str) -> None:
         bot = self.state["bots"].get(bot_id)
         if not bot:
             return
-        await self.stop(bot_id)
+        await self._stop_locked(bot_id)
         self.state["bots"].pop(bot_id, None)
         self.logs.pop(bot_id, None)
         self.persist()
