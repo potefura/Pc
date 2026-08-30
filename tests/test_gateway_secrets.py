@@ -94,6 +94,13 @@ class ReservedPathTests(unittest.TestCase):
     def test_normal_source_is_not_reserved(self):
         self.assertFalse(is_reserved_file_path("src/bot.py"))
 
+    def test_windows_absolute_file_path_is_rejected(self):
+        gateway = Gateway(FakeCloud())
+        request = FakeRequest()
+        request.match_info["path"] = r"C:\\Users\\owner\\secret.txt"
+        with self.assertRaises(web.HTTPForbidden):
+            gateway._file_target(request, gateway.cloud.bot)
+
 
 if __name__ == "__main__":
     unittest.main()
