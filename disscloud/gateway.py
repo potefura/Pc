@@ -135,7 +135,7 @@ class Gateway:
         self.cloud = cloud
         self.runner: web.AppRunner | None = None
 
-    async def start(self) -> None:
+    def create_app(self) -> web.Application:
         app = web.Application(middlewares=[proxy_middleware])
         app["oauth_states"] = {}
 
@@ -145,12 +145,16 @@ class Gateway:
         app.router.add_get("/auth/callback", self.handle_auth_callback)
         app.router.add_get("/auth/logout", self.handle_auth_logout)
         app.router.add_get("/api/me", self.handle_api_me)
-        app.router.add_get("/api/files", self.handle_api_files)
-        app.router.add_get("/api/events", self.handle_api_events)
-        app.router.add_get("/s/{name}", self.handle_site)
-        app.router.add_get("/s/{name}/", self.handle_site)
-        app.router.add_get("/s/{name}/{path:.*}", self.handle_site_path)
+        # Canonical ID routes must precede the overlapping legacy name route.
+        app.router.add_get("/s/{bot_id}/{slug}", self.handle_site)
+        app.router.add_get("/s/{bot_id}/{slug}/", self.handle_site)
+        app.router.add_get("/s/{bot_id}/{slug}/{path:.*}", self.handle_site_path)
+        app.router.add_get("/s/{name}", self.handle_legacy_site)
+        app.router.add_get("/s/{name}/", self.handle_legacy_site)
+        return app
 
+    async def start(self) -> None:
+        app = self.create_app()
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, config.SITE_HOST, config.SITE_PORT)
@@ -164,7 +168,7 @@ class Gateway:
             mode.append("Proxy")
         mode_text = f" [{', '.join(mode)}]" if mode else ""
         print(f"サイトゲートウェイ: ローカル {config.SITE_HOST}:{config.SITE_PORT}")
-        print(f"公開 URL{mode_text}: {public}  （各BOTは {public}/s/<名前>/ ）")
+        print(f"公開 URL{mode_text}: {public}  （各BOTは {public}/s/<BOT ID>/<名前>/ ）")
         if oauth_enabled():
             from .auth import oauth_redirect_uri
 
@@ -263,230 +267,51 @@ class Gateway:
                         "id": b["id"],
                         "name": b["name"],
                         "status": b["status"],
-                        "runtime": b.get("runtime") or "python",
-                        "entry": b.get("entry") or "",
-                        "site": bot_site_url(b["name"], request),
-                        "logs": self.cloud.get_logs(b["id"], 30),
+                        "site": bot_site_url(b["id"], b["name"], request),
                     }
                     for b in bots
                 ],
             }
         )
 
-    def _owned_bot(self, request: web.Request) -> tuple[dict, Path] | web.Response:
-        user = get_session_user(request)
-        if not user:
-            return web.json_response({"error": "Discord login required"}, status=401)
-        bot = self.cloud.get(request.match_info["bot_id"])
-        if not bot:
-            return web.json_response({"error": "bot not found"}, status=404)
-        if str(bot.get("ownerId")) != str(user["id"]):
-            return web.json_response({"error": "forbidden"}, status=403)
-        return bot, store.bot_dir(bot["id"], bot["ownerId"])
-
-    async def handle_files_list(self, request: web.Request) -> web.Response:
-        owned = self._owned_bot(request)
-        if isinstance(owned, web.Response):
-            return owned
-        _bot, root = owned
-        files = []
-        if root.exists():
-            for path in sorted(root.rglob("*")):
-                resolved = safe_join(root, str(path.relative_to(root)))
-                if resolved is None or path.is_symlink():
-                    continue
-                rel = path.relative_to(root).as_posix()
-                files.append({"path": rel, "type": "directory" if path.is_dir() else "file", "size": path.stat().st_size if path.is_file() else 0})
-        return web.json_response({"files": files})
-
-    async def handle_files_upload(self, request: web.Request) -> web.Response:
-        owned = self._owned_bot(request)
-        if isinstance(owned, web.Response):
-            return owned
-        _bot, root = owned
-        limit = config.MAX_UPLOAD_MB * 1024 * 1024
-        if request.content_length is not None and request.content_length > limit + 65536:
-            return web.json_response({"error": f"upload limit is {config.MAX_UPLOAD_MB}MB"}, status=413)
-        try:
-            reader = await request.multipart()
-            field = await reader.next()
-        except (AssertionError, ValueError):
-            return web.json_response({"error": "multipart file required"}, status=400)
-        while field is not None and not field.filename:
-            field = await reader.next()
-        if field is None or not field.filename:
-            return web.json_response({"error": "file required"}, status=400)
-        filename = Path(field.filename).name
-        target_dir_rel = request.query.get("path", "")
-        target_dir = root if not target_dir_rel else bot_file_path(root, target_dir_rel)
-        if target_dir is None:
-            return web.json_response({"error": "invalid path"}, status=400)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=".upload-", dir=root)
-        os.close(fd)
-        temp = Path(temp_name)
-        size = 0
-        try:
-            with temp.open("wb") as output:
-                while chunk := await field.read_chunk():
-                    size += len(chunk)
-                    if size > limit:
-                        return web.json_response({"error": f"upload limit is {config.MAX_UPLOAD_MB}MB"}, status=413)
-                    output.write(chunk)
-            if filename.lower().endswith(".zip"):
-                with zipfile.ZipFile(temp) as archive:
-                    if any((info.external_attr >> 16) & 0o170000 == 0o120000 for info in archive.infolist()):
-                        return web.json_response({"error": "symbolic links are not allowed in zip files"}, status=400)
-                extract_zip_safe(temp, target_dir)
-            else:
-                target = bot_file_path(target_dir, filename)
-                if target is None:
-                    return web.json_response({"error": "invalid filename"}, status=400)
-                shutil.move(str(temp), target)
-            return web.json_response({"ok": True, "name": filename}, status=201)
-        except (OSError, ValueError, zipfile.BadZipFile) as err:
-            return web.json_response({"error": str(err)}, status=400)
-        finally:
-            temp.unlink(missing_ok=True)
-
-    async def handle_file_get(self, request: web.Request) -> web.Response:
-        owned = self._owned_bot(request)
-        if isinstance(owned, web.Response):
-            return owned
-        _bot, root = owned
-        path = bot_file_path(root, request.match_info.get("path", ""))
-        if path is None:
-            return web.json_response({"error": "invalid path"}, status=400)
-        if not path.is_file():
-            return web.json_response({"error": "file not found"}, status=404)
-        if is_sensitive_path(path) or contains_sensitive_value(path):
-            return web.json_response({"error": "sensitive files cannot be downloaded"}, status=403)
-        if request.query.get("text") == "1":
-            try:
-                content = path.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError):
-                return web.json_response({"error": "not a UTF-8 text file"}, status=415)
-            return web.json_response({"path": request.match_info["path"], "content": content})
-        return web.FileResponse(path, headers={"Content-Disposition": f'attachment; filename="{path.name}"', "Cache-Control": "no-store"})
-
-    async def handle_file_put(self, request: web.Request) -> web.Response:
-        owned = self._owned_bot(request)
-        if isinstance(owned, web.Response):
-            return owned
-        _bot, root = owned
-        path = bot_file_path(root, request.match_info.get("path", ""))
-        if path is None or is_sensitive_path(path):
-            return web.json_response({"error": "invalid or sensitive path"}, status=400)
-        if request.content_length is not None and request.content_length > config.MAX_UPLOAD_MB * 1024 * 1024:
-            return web.json_response({"error": "file too large"}, status=413)
-        try:
-            data = await request.json()
-            content = data["content"]
-            if not isinstance(content, str):
-                raise ValueError
-        except (ValueError, KeyError, TypeError):
-            return web.json_response({"error": "JSON string content required"}, status=400)
-        if len(content.encode("utf-8")) > config.MAX_UPLOAD_MB * 1024 * 1024:
-            return web.json_response({"error": "file too large"}, status=413)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        return web.json_response({"ok": True})
-
-    async def handle_file_delete(self, request: web.Request) -> web.Response:
-        owned = self._owned_bot(request)
-        if isinstance(owned, web.Response):
-            return owned
-        _bot, root = owned
-        path = bot_file_path(root, request.match_info.get("path", ""))
-        if path is None:
-            return web.json_response({"error": "invalid path"}, status=400)
-        if not path.exists() or path.is_symlink():
-            return web.json_response({"error": "file not found"}, status=404)
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
-        return web.json_response({"ok": True})
-
-    async def handle_api_files(self, request: web.Request) -> web.Response:
-        user = get_session_user(request)
-        if not user:
-            return web.json_response({"authenticated": False}, status=401)
-        owner_id = str(user["id"])
-        files = []
-        for bot in self.cloud.list(owner_id):
-            root = store.bot_dir(bot["id"], owner_id)
-            if not root.exists():
-                continue
-            for path in root.rglob("*"):
-                rel = path.relative_to(root)
-                if any(part.startswith(".") for part in rel.parts):
-                    continue
-                files.append({
-                    "botId": bot["id"],
-                    "path": rel.as_posix(),
-                    "directory": path.is_dir(),
-                    "size": path.stat().st_size if path.is_file() else None,
-                })
-        return web.json_response({"files": files})
-
-    async def handle_api_events(self, request: web.Request) -> web.StreamResponse:
-        user = get_session_user(request)
-        if not user:
-            return web.json_response({"authenticated": False}, status=401)
-        owner_id = str(user["id"])
-        websocket = web.WebSocketResponse(heartbeat=30)
-        await websocket.prepare(request)
-        queue = self.cloud.subscribe(owner_id)
-        try:
-            while not websocket.closed:
-                event_task = asyncio.create_task(queue.get())
-                receive_task = asyncio.create_task(websocket.receive())
-                done, pending = await asyncio.wait(
-                    (event_task, receive_task), return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
-                if receive_task in done and receive_task.result().type in {
-                    web.WSMsgType.CLOSE, web.WSMsgType.CLOSED, web.WSMsgType.ERROR
-                }:
-                    break
-                if event_task in done:
-                    await websocket.send_json(event_task.result())
-        except (ConnectionError, asyncio.CancelledError):
-            pass
-        finally:
-            self.cloud.unsubscribe(owner_id, queue)
-            await websocket.close()
-        return websocket
-
-    def _find_bot(self, name: str) -> dict | None:
-        return self.cloud.get(name)
+    def _find_bot(self, bot_id: str) -> dict | None:
+        bot = self.cloud.get(bot_id)
+        return bot if bot and bot["id"] == bot_id else None
 
     async def handle_site(self, request: web.Request) -> web.Response:
-        return await self._serve_bot(request, request.match_info["name"], "index.html")
+        return await self._serve_bot(request, request.match_info["bot_id"], "index.html")
 
     async def handle_site_path(self, request: web.Request) -> web.Response:
         path = request.match_info.get("path", "") or "index.html"
-        return await self._serve_bot(request, request.match_info["name"], path)
+        return await self._serve_bot(request, request.match_info["bot_id"], path)
 
-    async def _serve_bot(self, request: web.Request, name: str, path: str) -> web.Response:
-        bot = self._find_bot(name)
+    async def handle_legacy_site(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        matches = [bot for bot in self.cloud.list() if bot["name"].lower() == name.lower()]
+        if len(matches) != 1:
+            return web.Response(text="site not found", status=404, content_type="text/plain", charset="utf-8")
+        bot = matches[0]
+        raise web.HTTPFound(bot_site_url(bot["id"], bot["name"], request))
+
+    async def _serve_bot(self, request: web.Request, bot_id: str, path: str) -> web.Response:
+        bot = self._find_bot(bot_id)
         if not bot:
-            return web.Response(text="site not found", status=404, content_type="text/plain; charset=utf-8")
+            return web.Response(text="site not found", status=404, content_type="text/plain", charset="utf-8")
 
         static_file = try_static(bot["id"], bot["ownerId"], path)
         if static_file:
             ext = static_file.suffix.lower()
             content_type = MIME_OVERRIDES.get(ext) or mimetypes.guess_type(str(static_file))[0] or "application/octet-stream"
-            return web.FileResponse(static_file, headers={"Cache-Control": "no-store"}, content_type=content_type)
+            return web.FileResponse(
+                static_file,
+                headers={"Cache-Control": "no-store", "Content-Type": content_type},
+            )
 
         disk = format_bytes(dir_size(store.bot_dir(bot["id"], bot["ownerId"])))
         mem = format_bytes(rss_of(bot.get("pid")))
-        site_url = bot_site_url(bot["name"], request)
+        site_url = bot_site_url(bot["id"], bot["name"], request)
         return web.Response(
             text=status_html(bot, disk, mem, site_url),
-            content_type="text/html; charset=utf-8",
+            content_type="text/html",
+            charset="utf-8",
         )

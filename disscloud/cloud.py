@@ -196,7 +196,7 @@ class Cloud:
         return None
 
     def site_url(self, bot: dict) -> str:
-        return bot_site_url(bot["name"])
+        return bot_site_url(bot["id"], bot["name"])
 
     def user_storage_path(self, owner_id: str) -> Path:
         return store.ensure_user_profile(owner_id)
