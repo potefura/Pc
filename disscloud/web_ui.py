@@ -25,6 +25,11 @@ main { max-width: 920px; margin: 32px auto; padding: 0 20px 48px; }
 .muted { color: #9aa0a6; }
 .ok { color: #57f287; }
 .off { color: #9aa0a6; }
+.secret-panel { margin-top: 14px; padding: 14px; background: #12151b; border-radius: 8px; }
+.secret-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+.secret-row input { background: #0f1115; color: #e8eaed; border: 1px solid #3b414d; border-radius: 6px; padding: 9px; }
+.secret-row input[type=password] { flex: 1; min-width: 220px; }
+.danger { background: #a12d37; }
 .user { display: flex; align-items: center; gap: 10px; }
 .user img { width: 36px; height: 36px; border-radius: 50%; }
 .file-toolbar, .file-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
@@ -100,8 +105,9 @@ def dashboard_page(user: dict[str, Any], cloud: Cloud, profile: dict[str, Any]) 
     synced_text = f"<code>{synced}</code>" if synced else "—"
 
     bot_rows = []
+    secret_panels = []
     for bot in bots:
-        site = bot_site_url(bot["id"], bot["name"])
+        site = bot_site_url(bot["name"])
         status_cls = "ok" if bot["status"] == "running" else "off"
         status = "稼働中" if bot["status"] == "running" else "停止"
         bot_rows.append(
@@ -112,6 +118,27 @@ def dashboard_page(user: dict[str, Any], cloud: Cloud, profile: dict[str, Any]) 
             f"<td><code>{html.escape(bot['entry'])}</code></td>"
             f"<td><a href='{html.escape(site)}'>サイト</a></td>"
             f"</tr>"
+        )
+        bot_id = html.escape(bot["id"])
+        secret_panels.append(
+            f"""<section class="secret-panel" data-bot-id="{bot_id}">
+  <h3>{html.escape(bot['name'])} の Secrets</h3>
+  <p class="muted">保存済みの値は表示されません。キー名だけを確認できます。</p>
+  <div class="secret-keys muted">読み込み中…</div>
+  <form class="secret-form secret-row">
+    <input name="key" placeholder="API_KEY" pattern="[A-Z_][A-Z0-9_]*" required>
+    <input name="value" type="password" placeholder="Secret value" autocomplete="new-password" required>
+    <button class="btn" type="submit">保存</button>
+  </form>
+  <h4>Discord BOT トークン</h4>
+  <p class="token-status muted">確認中…</p>
+  <form class="token-form secret-row">
+    <input name="value" type="password" placeholder="Discord token" autocomplete="new-password" required>
+    <button class="btn" type="submit">トークンを設定</button>
+    <button class="btn danger token-delete" type="button">削除</button>
+  </form>
+  <p class="secret-message muted" aria-live="polite"></p>
+</section>"""
         )
     table = (
         "<table id='bot-table' style='width:100%;border-collapse:collapse'>"
@@ -137,72 +164,49 @@ def dashboard_page(user: dict[str, Any], cloud: Cloud, profile: dict[str, Any]) 
   <p class="muted">フォルダ: <code>{html.escape(str(path))}</code></p>
 </div>
 <h2>あなたの BOT</h2>
-<div class="card" id="bots">{table}</div>
-<h2>ログ</h2>
-<div class="card"><pre id="event-log" style="white-space:pre-wrap;max-height:280px;overflow:auto">(ログなし)</pre></div>
-<h2>ファイル</h2>
-<div class="card"><ul id="file-tree" style="font-family:ui-monospace,monospace"><li class="muted">読み込み中...</li></ul></div>
+<div class="card">{table}</div>
+<h2>Secrets</h2>
+<div class="card">{"".join(secret_panels) or "<p class='muted'>BOT がありません。</p>"}</div>
 <p class="muted" style="margin-top:16px">BOT の作成・起動は Discord の <code>/cloud</code> コマンドから行えます。サイト上のデータは自動で同じフォルダに保存されます。</p>
 <script>
 (() => {{
-  const ownerId = {owner_id!r};
-  let retry = 1000, socket, refreshTimer;
-  const botNames = new Map();
-
-  function renderBots(data) {{
-    const box = document.getElementById('bots');
-    box.replaceChildren();
-    botNames.clear();
-    if (!data.bots.length) {{
-      const empty = document.createElement('p'); empty.className = 'muted';
-      empty.textContent = 'まだ BOT がありません。Discord で /cloud create を実行してください。'; box.append(empty); return;
-    }}
-    const table = document.createElement('table'); table.style.cssText = 'width:100%;border-collapse:collapse';
-    const head = table.insertRow(); ['BOT','状態','言語','エントリ','リンク'].forEach(x => {{ const th=document.createElement('th'); th.align='left'; th.textContent=x; head.append(th); }});
-    data.bots.forEach(bot => {{
-      botNames.set(bot.id, bot.name);
-      const row=table.insertRow();
-      [bot.name, bot.status === 'running' ? '稼働中' : '停止', bot.runtime, bot.entry].forEach((x,i) => {{ const td=row.insertCell(); td.textContent=x; if(i===1) td.className=bot.status==='running'?'ok':'off'; }});
-      const link=document.createElement('a'); link.href=bot.site; link.textContent='サイト'; row.insertCell().append(link);
-    }});
-    box.append(table);
-    const logs = data.bots.map(bot => `# ${{bot.name}}\n${{bot.logs}}`).join('\n\n');
-    document.getElementById('event-log').textContent = logs || '(ログなし)';
-  }}
-
-  async function refreshMe() {{
-    const response = await fetch('/api/me', {{cache:'no-store'}});
-    if (response.status === 401) {{ location.href='/auth/login'; return; }}
-    renderBots(await response.json());
-  }}
-  async function refreshFiles() {{
-    const response = await fetch('/api/files', {{cache:'no-store'}}); if (!response.ok) return;
-    const ul=document.getElementById('file-tree'); ul.replaceChildren();
-    const files=(await response.json()).files;
-    files.forEach(file => {{ const li=document.createElement('li'); li.textContent=`${{botNames.get(file.botId)||file.botId}}/${{file.path}}${{file.directory?'/':''}}`; ul.append(li); }});
-    if (!files.length) {{ const li=document.createElement('li'); li.className='muted'; li.textContent='ファイルなし'; ul.append(li); }}
-  }}
-  function reconcile() {{
-    clearTimeout(refreshTimer);
-    refreshTimer=setTimeout(() => Promise.all([refreshMe(), refreshFiles()]).catch(() => {{}}), 80);
-  }}
-  function connect() {{
-    const scheme=location.protocol==='https:'?'wss:':'ws:';
-    socket=new WebSocket(`${{scheme}}//${{location.host}}/api/events`);
-    socket.onopen=() => {{ retry=1000; Promise.all([refreshMe(), refreshFiles()]).catch(() => {{}}); }};
-    socket.onmessage=message => {{
-      let event; try {{ event=JSON.parse(message.data); }} catch (_) {{ return; }}
-      if (event.ownerId !== ownerId) return;
-      if (event.type === 'log.appended') {{
-        const log=document.getElementById('event-log');
-        log.textContent += `\n[${{botNames.get(event.botId)||event.botId}}] ${{event.state.line}}`; log.scrollTop=log.scrollHeight;
-      }} else if (event.type.startsWith('file.')) {{ refreshFiles().catch(() => {{}}); }}
-      else if (event.type.startsWith('bot.')) {{ reconcile(); }}
+  const request = async (url, options = {{}}) => {{
+    const response = await fetch(url, {{...options, headers: {{"Content-Type": "application/json", ...(options.headers || {{}})}}}});
+    if (!response.ok) throw new Error(`操作に失敗しました (${{response.status}})`);
+    return response.json();
+  }};
+  for (const panel of document.querySelectorAll(".secret-panel")) {{
+    const botId = encodeURIComponent(panel.dataset.botId);
+    const base = `/api/bots/${{botId}}/env`;
+    const message = panel.querySelector(".secret-message");
+    const load = async () => {{
+      const data = await request(base);
+      panel.querySelector(".secret-keys").textContent = data.keys.length ? `キー: ${{data.keys.join(", ")}}` : "通常のキーは未設定です";
+      panel.querySelector(".token-status").textContent = data.discordTokenConfigured ? "トークン設定済み" : "トークン未設定";
     }};
-    socket.onclose=() => {{ const wait=retry; retry=Math.min(retry*2,30000); setTimeout(connect, wait); }};
-    socket.onerror=() => socket.close();
+    panel.querySelector(".secret-form").addEventListener("submit", async event => {{
+      event.preventDefault();
+      const form = event.currentTarget;
+      const key = form.elements.key.value.toUpperCase();
+      const value = form.elements.value.value;
+      form.elements.value.value = "";
+      try {{ await request(`${{base}}/${{encodeURIComponent(key)}}`, {{method: "PUT", body: JSON.stringify({{value}})}}); message.textContent = `${{key}} を保存しました（値は表示しません）`; await load(); }}
+      catch (error) {{ message.textContent = error.message; }}
+    }});
+    panel.querySelector(".token-form").addEventListener("submit", async event => {{
+      event.preventDefault();
+      const input = event.currentTarget.elements.value;
+      const value = input.value;
+      input.value = "";
+      try {{ await request(`${{base}}/DISCORD_TOKEN`, {{method: "PUT", body: JSON.stringify({{value}})}}); message.textContent = "Discord トークンを保存しました（値は表示しません）"; await load(); }}
+      catch (error) {{ message.textContent = error.message; }}
+    }});
+    panel.querySelector(".token-delete").addEventListener("click", async () => {{
+      try {{ await request(`${{base}}/DISCORD_TOKEN`, {{method: "DELETE"}}); message.textContent = "Discord トークンを削除しました"; await load(); }}
+      catch (error) {{ message.textContent = error.message; }}
+    }});
+    load().catch(error => {{ message.textContent = error.message; }});
   }}
-  Promise.all([refreshMe(), refreshFiles()]).finally(connect);
 }})();
 </script>
 """

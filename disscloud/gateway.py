@@ -1,6 +1,7 @@
 import asyncio
 import html
 import mimetypes
+import re
 from pathlib import Path
 
 from aiohttp import web
@@ -29,6 +30,23 @@ MIME_OVERRIDES = {
     ".json": "application/json",
     ".svg": "image/svg+xml",
 }
+
+ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+RESERVED_FILE_NAMES = {".env", "cloud.log", ".ds_store"}
+RESERVED_FILE_PARTS = {".git", ".pip", ".venv", "__pycache__", "node_modules", "venv"}
+TEMP_FILE_SUFFIXES = (".tmp", ".temp", ".swp", ".swo", "~")
+
+
+def is_reserved_file_path(path: str) -> bool:
+    """Return true for secrets, logs, temporary files, and managed directories."""
+    parts = Path(path.replace("\\", "/")).parts
+    for part in parts:
+        lower = part.lower()
+        if lower in RESERVED_FILE_NAMES or lower in RESERVED_FILE_PARTS:
+            return True
+        if lower.startswith(".cloud") or lower.endswith(TEMP_FILE_SUFFIXES):
+            return True
+    return False
 
 
 def public_roots(bot_id: str, owner_id: str) -> list[Path]:
@@ -145,13 +163,16 @@ class Gateway:
         app.router.add_get("/auth/callback", self.handle_auth_callback)
         app.router.add_get("/auth/logout", self.handle_auth_logout)
         app.router.add_get("/api/me", self.handle_api_me)
-        # Canonical ID routes must precede the overlapping legacy name route.
-        app.router.add_get("/s/{bot_id}/{slug}", self.handle_site)
-        app.router.add_get("/s/{bot_id}/{slug}/", self.handle_site)
-        app.router.add_get("/s/{bot_id}/{slug}/{path:.*}", self.handle_site_path)
-        app.router.add_get("/s/{name}", self.handle_legacy_site)
-        app.router.add_get("/s/{name}/", self.handle_legacy_site)
-        return app
+        app.router.add_get("/api/bots/{bot_id}/env", self.handle_env_list)
+        app.router.add_put("/api/bots/{bot_id}/env/{key}", self.handle_env_put)
+        app.router.add_delete("/api/bots/{bot_id}/env/{key}", self.handle_env_delete)
+        app.router.add_get("/api/bots/{bot_id}/files", self.handle_file_list)
+        app.router.add_get("/api/bots/{bot_id}/files/{path:.*}", self.handle_file_get)
+        app.router.add_put("/api/bots/{bot_id}/files/{path:.*}", self.handle_file_put)
+        app.router.add_delete("/api/bots/{bot_id}/files/{path:.*}", self.handle_file_delete)
+        app.router.add_get("/s/{name}", self.handle_site)
+        app.router.add_get("/s/{name}/", self.handle_site)
+        app.router.add_get("/s/{name}/{path:.*}", self.handle_site_path)
 
     async def start(self) -> None:
         app = self.create_app()
@@ -274,9 +295,114 @@ class Gateway:
             }
         )
 
-    def _find_bot(self, bot_id: str) -> dict | None:
-        bot = self.cloud.get(bot_id)
-        return bot if bot and bot["id"] == bot_id else None
+    def _owned_bot(self, request: web.Request) -> tuple[dict | None, web.Response | None]:
+        user = get_session_user(request)
+        if not user:
+            return None, web.json_response({"error": "authentication required"}, status=401)
+        bot = self.cloud.get(request.match_info["bot_id"], str(user["id"]))
+        if not bot:
+            # Do not reveal whether another user's bot exists.
+            return None, web.json_response({"error": "bot not found"}, status=404)
+        return bot, None
+
+    @staticmethod
+    def _env_key(request: web.Request) -> str:
+        key = request.match_info["key"].upper()
+        if not ENV_KEY_RE.fullmatch(key):
+            raise web.HTTPBadRequest(text="invalid environment key")
+        return key
+
+    async def handle_env_list(self, request: web.Request) -> web.Response:
+        bot, error = self._owned_bot(request)
+        if error:
+            return error
+        env = self.cloud.get_env(bot["id"], bot["ownerId"])
+        return web.json_response(
+            {
+                "keys": sorted(key for key in env if key != "DISCORD_TOKEN"),
+                "discordTokenConfigured": bool(env.get("DISCORD_TOKEN")),
+            }
+        )
+
+    async def handle_env_put(self, request: web.Request) -> web.Response:
+        bot, error = self._owned_bot(request)
+        if error:
+            return error
+        key = self._env_key(request)
+        try:
+            payload = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid JSON")
+        value = payload.get("value") if isinstance(payload, dict) else None
+        if not isinstance(value, str) or not value or "\n" in value or "\r" in value:
+            raise web.HTTPBadRequest(text="value must be a non-empty single-line string")
+        if len(value) > 65536:
+            raise web.HTTPRequestEntityTooLarge(max_size=65536, actual_size=len(value))
+        self.cloud.set_env(bot["id"], bot["ownerId"], key, value)
+        return web.json_response({"key": key, "configured": True})
+
+    async def handle_env_delete(self, request: web.Request) -> web.Response:
+        bot, error = self._owned_bot(request)
+        if error:
+            return error
+        key = self._env_key(request)
+        self.cloud.set_env(bot["id"], bot["ownerId"], key, None)
+        return web.json_response({"key": key, "configured": False})
+
+    def _file_target(self, request: web.Request, bot: dict) -> Path:
+        rel = request.match_info.get("path", "").strip("/")
+        if not rel or is_reserved_file_path(rel):
+            raise web.HTTPForbidden(text="reserved path")
+        target = safe_join(store.bot_dir(bot["id"], bot["ownerId"]), rel)
+        if target is None:
+            raise web.HTTPForbidden(text="invalid path")
+        return target
+
+    async def handle_file_list(self, request: web.Request) -> web.Response:
+        bot, error = self._owned_bot(request)
+        if error:
+            return error
+        root = store.bot_dir(bot["id"], bot["ownerId"])
+        files = []
+        if root.exists():
+            files = sorted(
+                str(path.relative_to(root)).replace("\\", "/")
+                for path in root.rglob("*")
+                if path.is_file() and not is_reserved_file_path(str(path.relative_to(root)))
+            )
+        return web.json_response({"files": files})
+
+    async def handle_file_get(self, request: web.Request) -> web.Response:
+        bot, error = self._owned_bot(request)
+        if error:
+            return error
+        target = self._file_target(request, bot)
+        if not target.is_file():
+            raise web.HTTPNotFound(text="file not found")
+        return web.FileResponse(target, headers={"Cache-Control": "no-store"})
+
+    async def handle_file_put(self, request: web.Request) -> web.Response:
+        bot, error = self._owned_bot(request)
+        if error:
+            return error
+        target = self._file_target(request, bot)
+        data = await request.read()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return web.json_response({"path": str(target.relative_to(store.bot_dir(bot["id"], bot["ownerId"]))).replace("\\", "/")})
+
+    async def handle_file_delete(self, request: web.Request) -> web.Response:
+        bot, error = self._owned_bot(request)
+        if error:
+            return error
+        target = self._file_target(request, bot)
+        if not target.is_file():
+            raise web.HTTPNotFound(text="file not found")
+        target.unlink()
+        return web.json_response({"deleted": True})
+
+    def _find_bot(self, name: str) -> dict | None:
+        return self.cloud.get(name)
 
     async def handle_site(self, request: web.Request) -> web.Response:
         return await self._serve_bot(request, request.match_info["bot_id"], "index.html")
