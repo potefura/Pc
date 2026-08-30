@@ -108,7 +108,9 @@ cloudflared tunnel --url http://localhost:8080
 2. `/cloud token name:mybot` → Developer Portal で作った **別BOT** のトークンを入れる
 3. `/cloud start name:mybot`
 4. ゲストBOTを入れたサーバーで `/ping`
-5. ブラウザで `https://cloud.example.com/s/mybot/` を開く（`PUBLIC_URL` に合わせる）
+5. ブラウザで `https://cloud.example.com/s/<BOT ID>/mybot/` を開く（`PUBLIC_URL` に合わせる）
+
+公開サイトの推奨 URL は `/s/{bot_id}/{slug}/` です。`slug`（通常は BOT 名）は表示用であり、配信対象は一意な BOT ID で決まります。従来の `/s/{name}/` は移行期間中のみ利用でき、名前が全ユーザー間で一意な場合に限って新 URL へリダイレクトされます。同名 BOT が複数ある場合は 404 になります。
 
 自分のコードを使う場合は `/cloud create` にソースまたは zip を添付してください。言語は自動判定します（`language:` で明示も可）。`package.json` / `requirements.txt` / `go.mod` などがあれば依存関係も入れます。未導入のランタイムは自動インストールします。ゲストBOT側は環境変数 `DISCORD_TOKEN` を読んでログインしてください。
 

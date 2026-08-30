@@ -64,7 +64,7 @@ def landing_page(cloud: Cloud, public_base: str, user: dict[str, Any] | None) ->
     bots = cloud.list(user["id"] if user else None) if user else cloud.list()
     cards = []
     for bot in bots:
-        href = f"{public_base.rstrip('/')}/s/{bot['name']}/"
+        href = bot_site_url(bot["id"], bot["name"], base_url=public_base)
         status = "稼働中" if bot["status"] == "running" else "停止"
         cards.append(
             f'<a class="card" href="{html.escape(href)}"><strong>{html.escape(bot["name"])}</strong>'
@@ -90,7 +90,7 @@ def dashboard_page(user: dict[str, Any], cloud: Cloud, profile: dict[str, Any]) 
 
     bot_rows = []
     for bot in bots:
-        site = bot_site_url(bot["name"])
+        site = bot_site_url(bot["id"], bot["name"])
         status_cls = "ok" if bot["status"] == "running" else "off"
         status = "稼働中" if bot["status"] == "running" else "停止"
         bot_rows.append(

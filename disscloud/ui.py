@@ -119,7 +119,7 @@ def site_config_embed() -> discord.Embed:
         embed.add_field(name=key, value=value, inline=False)
     embed.add_field(
         name="BOTのURL形式",
-        value=f"`{config.display_public_url()}/s/<BOT名>/`",
+        value=f"`{config.display_public_url()}/s/<BOT ID>/<BOT名>/`",
         inline=False,
     )
     if config.CLOUDFLARE_TUNNEL:
