@@ -6,6 +6,7 @@ import random
 import re
 import shutil
 import sys
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -83,6 +84,7 @@ class Cloud:
         self.procs: dict[str, asyncio.subprocess.Process] = {}
         self.log_tasks: dict[str, asyncio.Task] = {}
         self.logs: dict[str, list[str]] = {}
+        self.deploy_locks: dict[str, asyncio.Lock] = {}
         store.ensure_dirs()
 
     def persist(self) -> None:
@@ -234,6 +236,112 @@ class Cloud:
             return
         await runtime.install_dependencies(directory, rt, log)
         log("準備完了")
+
+    async def deploy(
+        self,
+        bot_id: str,
+        source_url: str,
+        filename: str,
+        language: str | None = None,
+    ) -> dict:
+        """新しいソースを準備してから、現在のソースと入れ替える。"""
+        bot = self.state["bots"].get(bot_id)
+        if not bot:
+            raise ValueError("BOTが見つかりません")
+
+        lock = self.deploy_locks.setdefault(bot_id, asyncio.Lock())
+        async with lock:
+            directory = store.bot_dir(bot_id, bot["ownerId"])
+            preserved = {"data", ".env", "cloud.log"}
+            old_runtime = bot.get("runtime")
+            old_entry = bot.get("entry")
+            was_running = bot_id in self.procs
+            swapped = False
+
+            with tempfile.TemporaryDirectory(prefix=f"disscloud-{bot_id}-") as temp_name:
+                temp = Path(temp_name)
+                archive = temp / "upload"
+                staging = temp / "source"
+                backup = temp / "backup"
+                staging.mkdir()
+                backup.mkdir()
+
+                try:
+                    await download(source_url, archive)
+                    if filename.lower().endswith(".zip"):
+                        extract_zip_safe(archive, staging)
+                    else:
+                        # POSIX 上でも Windows 風のパスを切り落とす。保存対象名も上書きさせない。
+                        safe_name = Path(filename.replace("\\", "/")).name
+                        if not safe_name or safe_name in preserved or safe_name in {".", ".."}:
+                            safe_name = "source.bin"
+                        shutil.copy2(archive, staging / safe_name)
+
+                    # アップロードに含まれる永続データは採用しない。
+                    for name in preserved:
+                        path = staging / name
+                        if path.is_dir() and not path.is_symlink():
+                            shutil.rmtree(path)
+                        else:
+                            path.unlink(missing_ok=True)
+
+                    new_runtime, new_entry = runtime.resolve_entry(staging, hint=language)
+
+                    def log(line: str) -> None:
+                        self.push_log(bot_id, line)
+
+                    log(f"デプロイ準備 runtime={new_runtime} entry={new_entry}")
+                    await runtime.ensure_runtime(new_runtime, log)
+                    await runtime.install_dependencies(staging, new_runtime, log)
+
+                    if was_running:
+                        await self.stop(bot_id)
+
+                    directory.mkdir(parents=True, exist_ok=True)
+                    # ここから先の部分的な移動失敗もロールバック対象にする。
+                    swapped = True
+                    for child in list(directory.iterdir()):
+                        if child.name not in preserved:
+                            shutil.move(str(child), str(backup / child.name))
+                    for child in list(staging.iterdir()):
+                        shutil.move(str(child), str(directory / child.name))
+
+                    bot["runtime"] = new_runtime
+                    bot["entry"] = new_entry
+                    bot["lastError"] = None
+                    self.persist()
+
+                    if was_running:
+                        await self.start(bot_id)
+                    log(f"デプロイ完了 runtime={new_runtime} entry={new_entry}")
+                    return {**bot, "restarted": was_running}
+                except Exception as err:
+                    if swapped:
+                        # 新ソースを破棄し、退避したソースだけを戻す。
+                        for child in list(directory.iterdir()):
+                            if child.name not in preserved:
+                                if child.is_dir() and not child.is_symlink():
+                                    shutil.rmtree(child)
+                                else:
+                                    child.unlink(missing_ok=True)
+                        for child in list(backup.iterdir()):
+                            shutil.move(str(child), str(directory / child.name))
+                        bot["runtime"] = old_runtime
+                        bot["entry"] = old_entry
+                    message = f"デプロイ失敗: {err}"
+                    bot["lastError"] = message[:500]
+                    self.push_log(bot_id, message)
+                    self.persist()
+                    if swapped and was_running and bot_id not in self.procs:
+                        try:
+                            await self.start(bot_id)
+                        except Exception as restart_err:
+                            self.push_log(bot_id, f"ロールバック後の再起動失敗: {restart_err}")
+                        finally:
+                            # start() は成功時に lastError を消すため、デプロイ原因を再設定する。
+                            bot["lastError"] = message[:500]
+                            self.persist()
+                    raise
 
     def env_path(self, bot_id: str, owner_id: str) -> Path:
         return store.bot_dir(bot_id, owner_id) / ".env"
