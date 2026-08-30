@@ -1,3 +1,4 @@
+import asyncio
 import html
 import mimetypes
 from pathlib import Path
@@ -14,7 +15,7 @@ from .auth import (
     set_session_cookie,
     sync_user_from_discord,
 )
-from .cloud import Cloud
+from .cloud import Cloud, extract_zip_safe
 from .resources import dir_size, format_bytes, rss_of
 from .urls import bot_site_url, proxy_middleware, request_public_base
 from .web_ui import dashboard_page, landing_page, login_required_page, oauth_error_page
@@ -43,6 +44,39 @@ def safe_join(root: Path, rel: str) -> Path | None:
     except ValueError:
         return None
     return target
+
+
+SENSITIVE_NAMES = {".env", "cloud.log"}
+SENSITIVE_RE = re.compile(r"(?:token|secret|authorization|password)\s*[:=]", re.IGNORECASE)
+
+
+def bot_file_path(root: Path, rel: str, *, allow_root: bool = False) -> Path | None:
+    """Resolve an API path without permitting absolute paths or symlink escapes."""
+    if not isinstance(rel, str) or "\x00" in rel or Path(rel).is_absolute() or PureWindowsPath(rel).is_absolute():
+        return None
+    normalized = rel.replace("\\", "/")
+    if any(part in ("", ".", "..") for part in normalized.split("/")):
+        if not (allow_root and normalized in ("", ".")):
+            return None
+    target = safe_join(root, normalized)
+    if target is None or (not allow_root and target == root.resolve()):
+        return None
+    return target
+
+
+def is_sensitive_path(path: Path) -> bool:
+    name = path.name.lower()
+    return name in SENSITIVE_NAMES or "token" in name
+
+
+def contains_sensitive_value(path: Path) -> bool:
+    """Conservatively keep credential-looking text out of API responses."""
+    try:
+        if path.stat().st_size > config.MAX_UPLOAD_MB * 1024 * 1024:
+            return False
+        return bool(SENSITIVE_RE.search(path.read_text(encoding="utf-8")))
+    except (UnicodeDecodeError, OSError):
+        return False
 
 
 def escape_html(text: str) -> str:
@@ -230,6 +264,7 @@ class Gateway:
                 "profile": profile,
                 "bots": [
                     {
+                        "id": b["id"],
                         "name": b["name"],
                         "status": b["status"],
                         "site": bot_site_url(b["id"], b["name"], request),

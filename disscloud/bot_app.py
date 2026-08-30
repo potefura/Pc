@@ -149,6 +149,35 @@ async def cloud_create(
         embed=bot_embed(bot, site_url=interaction.client.cloud.site_url(bot)),
     )
 
+
+@cloud_group.command(name="deploy", description="BOTのソースを安全に更新")
+@app_commands.describe(
+    name="更新するBOT名",
+    source="新しいソースファイル / zip",
+    language="言語（省略時はファイルから自動判定）",
+)
+@app_commands.autocomplete(name=bot_name_autocomplete, language=language_autocomplete)
+async def cloud_deploy(
+    interaction: discord.Interaction,
+    name: str,
+    source: discord.Attachment,
+    language: str | None = None,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    bot = interaction.client.require_bot(interaction, name)
+    if source.size > config.MAX_UPLOAD_MB * 1024 * 1024:
+        raise ValueError(f"ファイルは {config.MAX_UPLOAD_MB}MB までです")
+    result = await interaction.client.cloud.deploy(bot["id"], source.url, source.filename, language)
+    restart_result = "再起動済み" if result["restarted"] else "停止状態を維持"
+    await interaction.followup.send(
+        f"✅ **{bot['name']}** をデプロイしました\n"
+        f"ランタイム: `{result['runtime']}`\n"
+        f"エントリ: `{result['entry']}`\n"
+        f"実行状態: {restart_result}",
+        ephemeral=True,
+    )
+
+
 @cloud_group.command(name="token", description="ゲストBOTのトークンを設定（モーダル・他人には見えません）")
 @app_commands.autocomplete(name=bot_name_autocomplete)
 async def cloud_token(interaction: discord.Interaction, name: str) -> None:
