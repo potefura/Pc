@@ -27,6 +27,17 @@ main { max-width: 920px; margin: 32px auto; padding: 0 20px 48px; }
 .off { color: #9aa0a6; }
 .user { display: flex; align-items: center; gap: 10px; }
 .user img { width: 36px; height: 36px; border-radius: 50%; }
+.file-toolbar, .file-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.file-toolbar select { margin-left: 6px; padding: 8px; color: inherit; background: #0f1115; border: 1px solid #3b414c; border-radius: 6px; }
+.file-drop { margin: 16px 0; padding: 20px; text-align: center; border: 2px dashed #3b414c; border-radius: 10px; color: #9aa0a6; }
+.file-drop.active { border-color: #5865f2; background: #20243b; }
+.file-workspace { display: grid; grid-template-columns: minmax(200px, 1fr) 2fr; gap: 16px; }
+.file-tree { min-height: 280px; max-height: 430px; overflow: auto; padding: 8px; background: #111318; border-radius: 8px; }
+.file-row { display: block; width: 100%; padding: 7px; color: inherit; background: transparent; border: 0; border-radius: 5px; text-align: left; cursor: pointer; }
+.file-row:hover:not(:disabled) { background: #2c313a; }.file-row:disabled { cursor: default; }
+.file-editor textarea { box-sizing: border-box; width: 100%; min-height: 330px; margin: 10px 0; padding: 12px; resize: vertical; color: #e8eaed; background: #0f1115; border: 1px solid #3b414c; border-radius: 8px; font: 13px ui-monospace, monospace; }
+.btn.danger { background: #da373c; }
+@media (max-width: 700px) { .file-workspace { grid-template-columns: 1fr; } }
 """
 
 
@@ -110,6 +121,91 @@ def dashboard_page(user: dict[str, Any], cloud: Cloud, profile: dict[str, Any]) 
         if bot_rows
         else "<p class='muted'>まだ BOT がありません。Discord で <code>/cloud create</code> を実行してください。</p>"
     )
+    bot_options = "".join(
+        f'<option value="{html.escape(str(bot["id"]))}">{html.escape(bot["name"])}</option>' for bot in bots
+    )
+    file_manager = f"""
+<h2>ファイル管理</h2>
+<div class="card file-manager">
+  <div class="file-toolbar">
+    <label>BOT <select id="file-bot">{bot_options}</select></label>
+    <label class="btn secondary" for="file-upload">ファイル / ZIP を選択</label>
+    <input id="file-upload" type="file" hidden>
+    <button class="btn secondary" id="file-refresh" type="button">更新</button>
+  </div>
+  <div id="file-drop" class="file-drop">ここにファイルまたは ZIP をドラッグ＆ドロップ</div>
+  <div class="file-workspace">
+    <div id="file-tree" class="file-tree"><span class="muted">BOT を選択してください</span></div>
+    <div class="file-editor">
+      <div><code id="file-current">ファイル未選択</code></div>
+      <textarea id="file-content" spellcheck="false" disabled></textarea>
+      <div class="file-actions">
+        <button class="btn" id="file-save" type="button" disabled>保存</button>
+        <button class="btn secondary" id="file-download" type="button" disabled>ダウンロード</button>
+        <button class="btn danger" id="file-delete" type="button" disabled>削除</button>
+      </div>
+    </div>
+  </div>
+  <p id="file-status" class="muted" role="status"></p>
+</div>
+<script>
+(() => {{
+  const bot = document.querySelector('#file-bot'), tree = document.querySelector('#file-tree');
+  const editor = document.querySelector('#file-content'), current = document.querySelector('#file-current');
+  const status = document.querySelector('#file-status'), upload = document.querySelector('#file-upload');
+  const buttons = ['save', 'download', 'delete'].map(x => document.querySelector('#file-' + x));
+  let selected = '';
+  const api = path => '/api/bots/' + encodeURIComponent(bot.value) + '/files' + (path ? '/' + path.split('/').map(encodeURIComponent).join('/') : '');
+  const message = text => status.textContent = text;
+  async function json(response) {{
+    const data = await response.json().catch(() => ({{error: 'リクエストに失敗しました'}}));
+    if (!response.ok) throw new Error(data.error || 'リクエストに失敗しました');
+    return data;
+  }}
+  async function refresh() {{
+    if (!bot.value) return;
+    try {{
+      const data = await json(await fetch(api('')));
+      tree.replaceChildren();
+      data.files.forEach(file => {{
+        const row = document.createElement('button');
+        row.type = 'button'; row.className = 'file-row ' + file.type;
+        row.textContent = (file.type === 'directory' ? '📁 ' : '📄 ') + file.path;
+        if (file.type === 'file') row.onclick = () => openFile(file.path);
+        else row.disabled = true;
+        tree.append(row);
+      }});
+      if (!data.files.length) tree.textContent = 'ファイルがありません';
+      message('');
+    }} catch (error) {{ message(error.message); }}
+  }}
+  async function openFile(path) {{
+    selected = path; current.textContent = path;
+    buttons.forEach(x => x.disabled = false);
+    try {{
+      const data = await json(await fetch(api(path) + '?text=1'));
+      editor.value = data.content; editor.disabled = false; message('テキストファイルを開きました');
+    }} catch (error) {{ editor.value = ''; editor.disabled = true; message(error.message); }}
+  }}
+  async function sendFile(file) {{
+    const form = new FormData(); form.append('file', file);
+    try {{ await json(await fetch(api(''), {{method: 'POST', body: form}})); message(file.name + ' をアップロードしました'); await refresh(); }}
+    catch (error) {{ message(error.message); }}
+  }}
+  document.querySelector('#file-refresh').onclick = refresh;
+  bot.onchange = () => {{ selected = ''; editor.value = ''; editor.disabled = true; buttons.forEach(x => x.disabled = true); refresh(); }};
+  upload.onchange = () => upload.files[0] && sendFile(upload.files[0]);
+  const drop = document.querySelector('#file-drop');
+  drop.ondragover = event => {{ event.preventDefault(); drop.classList.add('active'); }};
+  drop.ondragleave = () => drop.classList.remove('active');
+  drop.ondrop = event => {{ event.preventDefault(); drop.classList.remove('active'); if (event.dataTransfer.files[0]) sendFile(event.dataTransfer.files[0]); }};
+  buttons[0].onclick = async () => {{ try {{ await json(await fetch(api(selected), {{method:'PUT', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{content:editor.value}})}})); message('保存しました'); }} catch(error) {{ message(error.message); }} }};
+  buttons[1].onclick = () => {{ if (selected) location.href = api(selected); }};
+  buttons[2].onclick = async () => {{ if (!selected || !confirm(selected + ' を削除しますか？')) return; try {{ await json(await fetch(api(selected), {{method:'DELETE'}})); selected=''; editor.value=''; editor.disabled=true; buttons.forEach(x=>x.disabled=true); await refresh(); message('削除しました'); }} catch(error) {{ message(error.message); }} }};
+  refresh();
+}})();
+</script>
+""" if bots else ""
 
     header = f"""<div class="user">
       <img src="{html.escape(avatar_url(user))}" alt="">
@@ -127,6 +223,7 @@ def dashboard_page(user: dict[str, Any], cloud: Cloud, profile: dict[str, Any]) 
 </div>
 <h2>あなたの BOT</h2>
 <div class="card">{table}</div>
+{file_manager}
 <p class="muted" style="margin-top:16px">BOT の作成・起動は Discord の <code>/cloud</code> コマンドから行えます。サイト上のデータは自動で同じフォルダに保存されます。</p>
 """
     return _layout("ダッシュボード", body, header)
