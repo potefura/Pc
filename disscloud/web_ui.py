@@ -25,6 +25,11 @@ main { max-width: 920px; margin: 32px auto; padding: 0 20px 48px; }
 .muted { color: #9aa0a6; }
 .ok { color: #57f287; }
 .off { color: #9aa0a6; }
+.secret-panel { margin-top: 14px; padding: 14px; background: #12151b; border-radius: 8px; }
+.secret-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+.secret-row input { background: #0f1115; color: #e8eaed; border: 1px solid #3b414d; border-radius: 6px; padding: 9px; }
+.secret-row input[type=password] { flex: 1; min-width: 220px; }
+.danger { background: #a12d37; }
 .user { display: flex; align-items: center; gap: 10px; }
 .user img { width: 36px; height: 36px; border-radius: 50%; }
 """
@@ -89,6 +94,7 @@ def dashboard_page(user: dict[str, Any], cloud: Cloud, profile: dict[str, Any]) 
     synced_text = f"<code>{synced}</code>" if synced else "—"
 
     bot_rows = []
+    secret_panels = []
     for bot in bots:
         site = bot_site_url(bot["name"])
         status_cls = "ok" if bot["status"] == "running" else "off"
@@ -101,6 +107,27 @@ def dashboard_page(user: dict[str, Any], cloud: Cloud, profile: dict[str, Any]) 
             f"<td><code>{html.escape(bot['entry'])}</code></td>"
             f"<td><a href='{html.escape(site)}'>サイト</a></td>"
             f"</tr>"
+        )
+        bot_id = html.escape(bot["id"])
+        secret_panels.append(
+            f"""<section class="secret-panel" data-bot-id="{bot_id}">
+  <h3>{html.escape(bot['name'])} の Secrets</h3>
+  <p class="muted">保存済みの値は表示されません。キー名だけを確認できます。</p>
+  <div class="secret-keys muted">読み込み中…</div>
+  <form class="secret-form secret-row">
+    <input name="key" placeholder="API_KEY" pattern="[A-Z_][A-Z0-9_]*" required>
+    <input name="value" type="password" placeholder="Secret value" autocomplete="new-password" required>
+    <button class="btn" type="submit">保存</button>
+  </form>
+  <h4>Discord BOT トークン</h4>
+  <p class="token-status muted">確認中…</p>
+  <form class="token-form secret-row">
+    <input name="value" type="password" placeholder="Discord token" autocomplete="new-password" required>
+    <button class="btn" type="submit">トークンを設定</button>
+    <button class="btn danger token-delete" type="button">削除</button>
+  </form>
+  <p class="secret-message muted" aria-live="polite"></p>
+</section>"""
         )
     table = (
         "<table style='width:100%;border-collapse:collapse'>"
@@ -127,7 +154,50 @@ def dashboard_page(user: dict[str, Any], cloud: Cloud, profile: dict[str, Any]) 
 </div>
 <h2>あなたの BOT</h2>
 <div class="card">{table}</div>
+<h2>Secrets</h2>
+<div class="card">{"".join(secret_panels) or "<p class='muted'>BOT がありません。</p>"}</div>
 <p class="muted" style="margin-top:16px">BOT の作成・起動は Discord の <code>/cloud</code> コマンドから行えます。サイト上のデータは自動で同じフォルダに保存されます。</p>
+<script>
+(() => {{
+  const request = async (url, options = {{}}) => {{
+    const response = await fetch(url, {{...options, headers: {{"Content-Type": "application/json", ...(options.headers || {{}})}}}});
+    if (!response.ok) throw new Error(`操作に失敗しました (${{response.status}})`);
+    return response.json();
+  }};
+  for (const panel of document.querySelectorAll(".secret-panel")) {{
+    const botId = encodeURIComponent(panel.dataset.botId);
+    const base = `/api/bots/${{botId}}/env`;
+    const message = panel.querySelector(".secret-message");
+    const load = async () => {{
+      const data = await request(base);
+      panel.querySelector(".secret-keys").textContent = data.keys.length ? `キー: ${{data.keys.join(", ")}}` : "通常のキーは未設定です";
+      panel.querySelector(".token-status").textContent = data.discordTokenConfigured ? "トークン設定済み" : "トークン未設定";
+    }};
+    panel.querySelector(".secret-form").addEventListener("submit", async event => {{
+      event.preventDefault();
+      const form = event.currentTarget;
+      const key = form.elements.key.value.toUpperCase();
+      const value = form.elements.value.value;
+      form.elements.value.value = "";
+      try {{ await request(`${{base}}/${{encodeURIComponent(key)}}`, {{method: "PUT", body: JSON.stringify({{value}})}}); message.textContent = `${{key}} を保存しました（値は表示しません）`; await load(); }}
+      catch (error) {{ message.textContent = error.message; }}
+    }});
+    panel.querySelector(".token-form").addEventListener("submit", async event => {{
+      event.preventDefault();
+      const input = event.currentTarget.elements.value;
+      const value = input.value;
+      input.value = "";
+      try {{ await request(`${{base}}/DISCORD_TOKEN`, {{method: "PUT", body: JSON.stringify({{value}})}}); message.textContent = "Discord トークンを保存しました（値は表示しません）"; await load(); }}
+      catch (error) {{ message.textContent = error.message; }}
+    }});
+    panel.querySelector(".token-delete").addEventListener("click", async () => {{
+      try {{ await request(`${{base}}/DISCORD_TOKEN`, {{method: "DELETE"}}); message.textContent = "Discord トークンを削除しました"; await load(); }}
+      catch (error) {{ message.textContent = error.message; }}
+    }});
+    load().catch(error => {{ message.textContent = error.message; }});
+  }}
+}})();
+</script>
 """
     return _layout("ダッシュボード", body, header)
 
