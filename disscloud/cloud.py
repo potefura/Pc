@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import random
 import re
@@ -10,6 +11,7 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 
@@ -84,8 +86,87 @@ class Cloud:
         self.procs: dict[str, asyncio.subprocess.Process] = {}
         self.log_tasks: dict[str, asyncio.Task] = {}
         self.logs: dict[str, list[str]] = {}
-        self.deploy_locks: dict[str, asyncio.Lock] = {}
+        self._subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
         store.ensure_dirs()
+
+    def subscribe(self, owner_id: str) -> asyncio.Queue[dict[str, Any]]:
+        """Subscribe to events for exactly one Discord user."""
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
+        self._subscribers.setdefault(str(owner_id), set()).add(queue)
+        return queue
+
+    def unsubscribe(self, owner_id: str, queue: asyncio.Queue[dict[str, Any]]) -> None:
+        subscribers = self._subscribers.get(str(owner_id))
+        if not subscribers:
+            return
+        subscribers.discard(queue)
+        if not subscribers:
+            self._subscribers.pop(str(owner_id), None)
+
+    def notify(self, event_type: str, *, owner_id: str, bot_id: str | None = None, state: dict | None = None) -> None:
+        """Publish a deliberately small, JSON-safe event to an owner's connections."""
+        event: dict[str, Any] = {
+            "type": event_type,
+            "ownerId": str(owner_id),
+            "botId": bot_id,
+            "time": int(time.time() * 1000),
+            "state": state or {},
+        }
+        for queue in tuple(self._subscribers.get(str(owner_id), ())):
+            if queue.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(event)
+
+    @staticmethod
+    def _public_bot(bot: dict) -> dict:
+        keys = ("id", "name", "runtime", "entry", "status", "autoRestart", "createdAt", "restarts", "siteEnabled")
+        return {key: bot.get(key) for key in keys}
+
+    def _bot_event(self, event_type: str, bot: dict) -> None:
+        self.notify(event_type, owner_id=bot["ownerId"], bot_id=bot["id"], state={"bot": self._public_bot(bot)})
+
+    def notify_file_change(self, event_type: str, bot: dict, path: str) -> None:
+        if event_type not in {"file.created", "file.updated", "file.deleted"}:
+            raise ValueError("unknown file event")
+        # Never reveal dotenv/dependency internals through the event stream.
+        clean = Path(path).as_posix().lstrip("/")
+        if not clean or any(part.startswith(".") for part in Path(clean).parts):
+            return
+        self.notify(event_type, owner_id=bot["ownerId"], bot_id=bot["id"], state={"path": clean})
+
+    def write_file(self, bot_id: str, owner_id: str, path: str, content: str) -> None:
+        bot = self.get(bot_id, owner_id)
+        if not bot:
+            raise ValueError("BOTが見つかりません")
+        root = store.bot_dir(bot_id, owner_id).resolve()
+        target = (root / path).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as err:
+            raise ValueError("不正なパスです") from err
+        if any(part.startswith(".") for part in target.relative_to(root).parts):
+            raise ValueError("隠しファイルは編集できません")
+        existed = target.exists()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        self.notify_file_change("file.updated" if existed else "file.created", bot, path)
+
+    def delete_file(self, bot_id: str, owner_id: str, path: str) -> None:
+        bot = self.get(bot_id, owner_id)
+        if not bot:
+            raise ValueError("BOTが見つかりません")
+        root = store.bot_dir(bot_id, owner_id).resolve()
+        target = (root / path).resolve()
+        try:
+            rel = target.relative_to(root)
+        except ValueError as err:
+            raise ValueError("不正なパスです") from err
+        if not target.is_file() or any(part.startswith(".") for part in rel.parts):
+            raise ValueError("ファイルが見つかりません")
+        target.unlink()
+        self.notify_file_change("file.deleted", bot, rel.as_posix())
 
     def persist(self) -> None:
         clone = {"bots": {}}
@@ -126,7 +207,15 @@ class Cloud:
         if not text:
             return
         for part in text.split("\n"):
-            buf.append(f"[{time.strftime('%H:%M:%S')}] {part}")
+            rendered = f"[{time.strftime('%H:%M:%S')}] {part}"
+            buf.append(rendered)
+            bot = self.state["bots"].get(bot_id)
+            if bot:
+                redacted = part
+                for secret in self.get_env(bot_id, bot["ownerId"]).values():
+                    if secret:
+                        redacted = redacted.replace(secret, "[REDACTED]")
+                self.notify("log.appended", owner_id=bot["ownerId"], bot_id=bot_id, state={"line": f"[{time.strftime('%H:%M:%S')}] {redacted}"})
         while len(buf) > config.LOG_BUFFER_SIZE:
             buf.pop(0)
         bot = self.state["bots"].get(bot_id)
@@ -213,6 +302,10 @@ class Cloud:
         }
         self.state["bots"][bot_id] = bot
         self.persist()
+        self._bot_event("bot.created", bot)
+        for file_path in directory.rglob("*"):
+            if file_path.is_file():
+                self.notify_file_change("file.created", bot, str(file_path.relative_to(directory)))
         await self.install(bot)
         return bot
 
@@ -226,122 +319,19 @@ class Cloud:
         def log(line: str) -> None:
             self.push_log(bot["id"], line)
 
+        self._bot_event("bot.deploying", bot)
         log(f"ランタイム `{rt}` を準備しています...")
         try:
             await runtime.ensure_runtime(rt, log)
-        except RuntimeError as err:
+            await runtime.install_dependencies(directory, rt, log)
+        except Exception as err:
             log(str(err))
             bot["lastError"] = str(err)[:500]
             self.persist()
+            self._bot_event("bot.deploy_failed", bot)
             return
-        await runtime.install_dependencies(directory, rt, log)
         log("準備完了")
-
-    async def deploy(
-        self,
-        bot_id: str,
-        source_url: str,
-        filename: str,
-        language: str | None = None,
-    ) -> dict:
-        """新しいソースを準備してから、現在のソースと入れ替える。"""
-        bot = self.state["bots"].get(bot_id)
-        if not bot:
-            raise ValueError("BOTが見つかりません")
-
-        lock = self.deploy_locks.setdefault(bot_id, asyncio.Lock())
-        async with lock:
-            directory = store.bot_dir(bot_id, bot["ownerId"])
-            preserved = {"data", ".env", "cloud.log"}
-            old_runtime = bot.get("runtime")
-            old_entry = bot.get("entry")
-            was_running = bot_id in self.procs
-            swapped = False
-
-            with tempfile.TemporaryDirectory(prefix=f"disscloud-{bot_id}-") as temp_name:
-                temp = Path(temp_name)
-                archive = temp / "upload"
-                staging = temp / "source"
-                backup = temp / "backup"
-                staging.mkdir()
-                backup.mkdir()
-
-                try:
-                    await download(source_url, archive)
-                    if filename.lower().endswith(".zip"):
-                        extract_zip_safe(archive, staging)
-                    else:
-                        # POSIX 上でも Windows 風のパスを切り落とす。保存対象名も上書きさせない。
-                        safe_name = Path(filename.replace("\\", "/")).name
-                        if not safe_name or safe_name in preserved or safe_name in {".", ".."}:
-                            safe_name = "source.bin"
-                        shutil.copy2(archive, staging / safe_name)
-
-                    # アップロードに含まれる永続データは採用しない。
-                    for name in preserved:
-                        path = staging / name
-                        if path.is_dir() and not path.is_symlink():
-                            shutil.rmtree(path)
-                        else:
-                            path.unlink(missing_ok=True)
-
-                    new_runtime, new_entry = runtime.resolve_entry(staging, hint=language)
-
-                    def log(line: str) -> None:
-                        self.push_log(bot_id, line)
-
-                    log(f"デプロイ準備 runtime={new_runtime} entry={new_entry}")
-                    await runtime.ensure_runtime(new_runtime, log)
-                    await runtime.install_dependencies(staging, new_runtime, log)
-
-                    if was_running:
-                        await self.stop(bot_id)
-
-                    directory.mkdir(parents=True, exist_ok=True)
-                    # ここから先の部分的な移動失敗もロールバック対象にする。
-                    swapped = True
-                    for child in list(directory.iterdir()):
-                        if child.name not in preserved:
-                            shutil.move(str(child), str(backup / child.name))
-                    for child in list(staging.iterdir()):
-                        shutil.move(str(child), str(directory / child.name))
-
-                    bot["runtime"] = new_runtime
-                    bot["entry"] = new_entry
-                    bot["lastError"] = None
-                    self.persist()
-
-                    if was_running:
-                        await self.start(bot_id)
-                    log(f"デプロイ完了 runtime={new_runtime} entry={new_entry}")
-                    return {**bot, "restarted": was_running}
-                except Exception as err:
-                    if swapped:
-                        # 新ソースを破棄し、退避したソースだけを戻す。
-                        for child in list(directory.iterdir()):
-                            if child.name not in preserved:
-                                if child.is_dir() and not child.is_symlink():
-                                    shutil.rmtree(child)
-                                else:
-                                    child.unlink(missing_ok=True)
-                        for child in list(backup.iterdir()):
-                            shutil.move(str(child), str(directory / child.name))
-                        bot["runtime"] = old_runtime
-                        bot["entry"] = old_entry
-                    message = f"デプロイ失敗: {err}"
-                    bot["lastError"] = message[:500]
-                    self.push_log(bot_id, message)
-                    self.persist()
-                    if swapped and was_running and bot_id not in self.procs:
-                        try:
-                            await self.start(bot_id)
-                        except Exception as restart_err:
-                            self.push_log(bot_id, f"ロールバック後の再起動失敗: {restart_err}")
-                        finally:
-                            # start() は成功時に lastError を消すため、デプロイ原因を再設定する。
-                            bot["lastError"] = message[:500]
-                            self.persist()
-                    raise
+        self._bot_event("bot.deployed", bot)
 
     def env_path(self, bot_id: str, owner_id: str) -> Path:
         return store.bot_dir(bot_id, owner_id) / ".env"
@@ -358,6 +348,9 @@ class Cloud:
         path = self.env_path(bot_id, owner_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         store.write_dotenv(path, env)
+        bot = self.state["bots"].get(bot_id)
+        if bot and bot["ownerId"] == str(owner_id):
+            self._bot_event("bot.updated", bot)
 
     def has_token(self, bot_id: str, owner_id: str) -> bool:
         env = self.get_env(bot_id, owner_id)
@@ -425,6 +418,7 @@ class Cloud:
         bot["pid"] = proc.pid
         bot["lastError"] = None
         self.persist()
+        self._bot_event("bot.started", bot)
         self.push_log(bot_id, f"プロセス起動 pid={proc.pid} runtime={rt} entry={entry} cmd={' '.join(argv)}")
 
         if proc.stdout:
@@ -451,6 +445,7 @@ class Cloud:
         bot["status"] = "stopped"
         self.push_log(bot_id, f"終了 code={code}")
         self.persist()
+        self._bot_event("bot.stopped", bot)
 
         if wanted and bot.get("autoRestart"):
             bot["restarts"] = bot.get("restarts", 0) + 1
@@ -470,6 +465,8 @@ class Cloud:
         proc = self.procs.get(bot_id)
         bot["status"] = "running" if restart_later else "stopped"
         self.persist()
+        if not restart_later and not proc:
+            self._bot_event("bot.stopped", bot)
         if not proc:
             return bot
         proc.terminate()
@@ -496,6 +493,7 @@ class Cloud:
         self.persist()
         directory = store.bot_dir(bot_id, bot["ownerId"])
         shutil.rmtree(directory, ignore_errors=True)
+        self._bot_event("bot.deleted", bot)
 
     async def stop_all(self) -> None:
         for bot_id in list(self.procs.keys()):
