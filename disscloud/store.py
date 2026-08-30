@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -26,7 +28,23 @@ def load() -> dict:
 
 def save(state: dict) -> None:
     ensure_dirs()
-    STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Keep the temporary file on the same filesystem: Path.replace is then an
+    # atomic operation and readers can only observe the old or the new JSON.
+    fd, name = tempfile.mkstemp(prefix=f".{STATE_PATH.name}.", suffix=".tmp", dir=STATE_PATH.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(state, file, indent=2, ensure_ascii=False)
+            file.flush()
+            try:
+                os.fsync(file.fileno())
+            except OSError:
+                # Some virtual filesystems do not implement fsync.
+                pass
+        temporary.replace(STATE_PATH)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def user_dir(owner_id: str) -> Path:
