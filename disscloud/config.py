@@ -1,6 +1,12 @@
 import os
 from urllib.parse import urlparse
 
+from dotenv import load_dotenv
+
+# 設定値をモジュール定数へ読み込む前に .env を反映する。
+# 以前は bot_app.py 側で読み込んでいたため、このモジュールの値には反映されなかった。
+load_dotenv()
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 MAX_BOTS_PER_USER = int(os.getenv("MAX_BOTS_PER_USER", "5"))
@@ -59,6 +65,7 @@ def site_settings_summary() -> dict[str, str]:
         "プロキシ信頼": "有効" if TRUST_PROXY else "無効",
         "Cloudflareドメイン": CLOUDFLARE_DOMAIN or "(未設定)",
         "Discordログイン": "有効" if (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and SESSION_SECRET) else "無効",
+        "コマンド同期": "グローバル同期（全サーバー）",
     }
 
 

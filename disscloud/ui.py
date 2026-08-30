@@ -85,6 +85,7 @@ def help_embed(site_base: str) -> discord.Embed:
             "`/cloud logs` `/cloud list` `/cloud panel`\n"
             "`/cloud site` 公開URL\n"
             "`/cloud config` サイト設定（Cloudflare）\n"
+            "`/cloud sync` コマンド再同期（管理者）\n"
             "`/cloud storage` 個人フォルダ情報\n"
             "`/cloud env` 環境変数\n"
             "`/cloud delete` 削除"
