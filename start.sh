@@ -44,4 +44,4 @@ fi
 
 echo "依存関係を確認中..."
 "$PY" -m pip install -r requirements.txt -q || "$PY" -m pip install -r requirements.txt
-exec "$PY" -m disccloud
+exec "$PY" -m disscloud

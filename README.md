@@ -35,7 +35,7 @@ copy .env.example .env
 
 ```bash
 pip install -r requirements.txt
-python -m disccloud
+python -m disscloud
 ```
 
 Windows なら `start.cmd`、Linux / Termux なら `bash start.sh` でも起動できます。
@@ -51,8 +51,12 @@ bash start.sh
 
 初回は `.env` が作られるので `DISCORD_TOKEN` を入れてから、もう一度 `bash start.sh` してください。ゲストBOT用の言語（Node.js など）は、そのBOTを起動するときに自動で `pkg install` されます。
 
-起動後、サーバーで `/cloud help` が使えればOKです。  
+起動後、サーバーで `/cloud help` が使えればOKです。
 サイトは `http://localhost:8080`（ローカル）で公開されます。Cloudflare 経由の場合は下記を参照してください。
+
+### スラッシュコマンドが同期されない場合
+
+起動時に `/cloud` 以下のコマンドをグローバル同期し、BOT が参加している全サーバーへ登録します。反映されない場合は管理者が `/cloud sync` を実行してください。Discord 側でグローバルコマンドの反映に時間がかかる場合があります。
 
 ## Cloudflare で公開する
 

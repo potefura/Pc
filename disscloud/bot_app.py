@@ -6,7 +6,6 @@ import signal
 import discord
 from discord import app_commands
 from discord.ext import commands
-from dotenv import load_dotenv
 
 from . import config
 from .cloud import Cloud
@@ -23,9 +22,6 @@ from .ui import (
     site_config_embed,
     storage_embed,
 )
-
-load_dotenv()
-
 
 def admin_ids() -> set[str]:
     raw = os.getenv("ADMIN_IDS", "")
@@ -53,8 +49,14 @@ class SouCloudBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         self.tree.add_command(cloud_group)
-        await self.tree.sync()
-        print("スラッシュコマンドを登録しました: /cloud")
+        await self.sync_commands()
+
+    async def sync_commands(self) -> list[str]:
+        """アプリコマンドを全サーバー対象でグローバル同期する。"""
+        commands_synced = await self.tree.sync()
+        result = f"グローバル: {len(commands_synced)}件"
+        print(f"スラッシュコマンド同期完了 — {result}")
+        return [result]
 
     def require_bot(self, interaction: discord.Interaction, name: str) -> dict:
         bot = self.cloud.get(name, str(interaction.user.id)) or self.cloud.get(name)
@@ -94,6 +96,18 @@ async def cloud_help(interaction: discord.Interaction) -> None:
 @cloud_group.command(name="config", description="サイト公開設定（Cloudflare URL など）を表示")
 async def cloud_config(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=site_config_embed(), ephemeral=True)
+
+
+@cloud_group.command(name="sync", description="スラッシュコマンドを再同期（管理者のみ）")
+async def cloud_sync(interaction: discord.Interaction) -> None:
+    is_admin = str(interaction.user.id) in admin_ids()
+    if isinstance(interaction.user, discord.Member):
+        is_admin = is_admin or interaction.user.guild_permissions.administrator
+    if not is_admin:
+        raise ValueError("このコマンドは管理者だけが実行できます")
+    await interaction.response.defer(ephemeral=True)
+    results = await interaction.client.sync_commands()
+    await interaction.followup.send("✅ コマンドを再同期しました\n" + "\n".join(results), ephemeral=True)
 
 
 @cloud_group.command(name="list", description="自分のBOT一覧")
@@ -263,6 +277,16 @@ async def run() -> None:
     await gateway.start()
 
     bot = SouCloudBot(cloud)
+
+    @bot.tree.error
+    async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+        original = getattr(error, "original", error)
+        message = str(original) or "コマンドの実行中にエラーが発生しました"
+        if interaction.response.is_done():
+            await interaction.followup.send(f"⚠️ {message}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"⚠️ {message}", ephemeral=True)
+        print(f"コマンドエラー: {type(original).__name__}: {original}")
 
     @bot.event
     async def on_ready() -> None:

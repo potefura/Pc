@@ -21,5 +21,5 @@ if not exist .env (
 )
 echo 依存関係を確認中...
 %PYTHON% -m pip install -r requirements.txt -q
-%PYTHON% -m disccloud
+%PYTHON% -m disscloud
 pause
