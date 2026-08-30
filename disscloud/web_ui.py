@@ -103,12 +103,12 @@ def dashboard_page(user: dict[str, Any], cloud: Cloud, profile: dict[str, Any]) 
             f"</tr>"
         )
     table = (
-        "<table style='width:100%;border-collapse:collapse'>"
+        "<table id='bot-table' style='width:100%;border-collapse:collapse'>"
         "<tr><th align='left'>BOT</th><th align='left'>状態</th><th align='left'>言語</th><th align='left'>エントリ</th><th align='left'>リンク</th></tr>"
         + "".join(bot_rows)
         + "</table>"
         if bot_rows
-        else "<p class='muted'>まだ BOT がありません。Discord で <code>/cloud create</code> を実行してください。</p>"
+        else "<p id='bot-empty' class='muted'>まだ BOT がありません。Discord で <code>/cloud create</code> を実行してください。</p>"
     )
 
     header = f"""<div class="user">
@@ -126,8 +126,74 @@ def dashboard_page(user: dict[str, Any], cloud: Cloud, profile: dict[str, Any]) 
   <p class="muted">フォルダ: <code>{html.escape(str(path))}</code></p>
 </div>
 <h2>あなたの BOT</h2>
-<div class="card">{table}</div>
+<div class="card" id="bots">{table}</div>
+<h2>ログ</h2>
+<div class="card"><pre id="event-log" style="white-space:pre-wrap;max-height:280px;overflow:auto">(ログなし)</pre></div>
+<h2>ファイル</h2>
+<div class="card"><ul id="file-tree" style="font-family:ui-monospace,monospace"><li class="muted">読み込み中...</li></ul></div>
 <p class="muted" style="margin-top:16px">BOT の作成・起動は Discord の <code>/cloud</code> コマンドから行えます。サイト上のデータは自動で同じフォルダに保存されます。</p>
+<script>
+(() => {{
+  const ownerId = {owner_id!r};
+  let retry = 1000, socket, refreshTimer;
+  const botNames = new Map();
+
+  function renderBots(data) {{
+    const box = document.getElementById('bots');
+    box.replaceChildren();
+    botNames.clear();
+    if (!data.bots.length) {{
+      const empty = document.createElement('p'); empty.className = 'muted';
+      empty.textContent = 'まだ BOT がありません。Discord で /cloud create を実行してください。'; box.append(empty); return;
+    }}
+    const table = document.createElement('table'); table.style.cssText = 'width:100%;border-collapse:collapse';
+    const head = table.insertRow(); ['BOT','状態','言語','エントリ','リンク'].forEach(x => {{ const th=document.createElement('th'); th.align='left'; th.textContent=x; head.append(th); }});
+    data.bots.forEach(bot => {{
+      botNames.set(bot.id, bot.name);
+      const row=table.insertRow();
+      [bot.name, bot.status === 'running' ? '稼働中' : '停止', bot.runtime, bot.entry].forEach((x,i) => {{ const td=row.insertCell(); td.textContent=x; if(i===1) td.className=bot.status==='running'?'ok':'off'; }});
+      const link=document.createElement('a'); link.href=bot.site; link.textContent='サイト'; row.insertCell().append(link);
+    }});
+    box.append(table);
+    const logs = data.bots.map(bot => `# ${{bot.name}}\n${{bot.logs}}`).join('\n\n');
+    document.getElementById('event-log').textContent = logs || '(ログなし)';
+  }}
+
+  async function refreshMe() {{
+    const response = await fetch('/api/me', {{cache:'no-store'}});
+    if (response.status === 401) {{ location.href='/auth/login'; return; }}
+    renderBots(await response.json());
+  }}
+  async function refreshFiles() {{
+    const response = await fetch('/api/files', {{cache:'no-store'}}); if (!response.ok) return;
+    const ul=document.getElementById('file-tree'); ul.replaceChildren();
+    const files=(await response.json()).files;
+    files.forEach(file => {{ const li=document.createElement('li'); li.textContent=`${{botNames.get(file.botId)||file.botId}}/${{file.path}}${{file.directory?'/':''}}`; ul.append(li); }});
+    if (!files.length) {{ const li=document.createElement('li'); li.className='muted'; li.textContent='ファイルなし'; ul.append(li); }}
+  }}
+  function reconcile() {{
+    clearTimeout(refreshTimer);
+    refreshTimer=setTimeout(() => Promise.all([refreshMe(), refreshFiles()]).catch(() => {{}}), 80);
+  }}
+  function connect() {{
+    const scheme=location.protocol==='https:'?'wss:':'ws:';
+    socket=new WebSocket(`${{scheme}}//${{location.host}}/api/events`);
+    socket.onopen=() => {{ retry=1000; Promise.all([refreshMe(), refreshFiles()]).catch(() => {{}}); }};
+    socket.onmessage=message => {{
+      let event; try {{ event=JSON.parse(message.data); }} catch (_) {{ return; }}
+      if (event.ownerId !== ownerId) return;
+      if (event.type === 'log.appended') {{
+        const log=document.getElementById('event-log');
+        log.textContent += `\n[${{botNames.get(event.botId)||event.botId}}] ${{event.state.line}}`; log.scrollTop=log.scrollHeight;
+      }} else if (event.type.startsWith('file.')) {{ refreshFiles().catch(() => {{}}); }}
+      else if (event.type.startsWith('bot.')) {{ reconcile(); }}
+    }};
+    socket.onclose=() => {{ const wait=retry; retry=Math.min(retry*2,30000); setTimeout(connect, wait); }};
+    socket.onerror=() => socket.close();
+  }}
+  Promise.all([refreshMe(), refreshFiles()]).finally(connect);
+}})();
+</script>
 """
     return _layout("ダッシュボード", body, header)
 

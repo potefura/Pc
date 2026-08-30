@@ -1,3 +1,4 @@
+import asyncio
 import html
 import mimetypes
 from pathlib import Path
@@ -111,6 +112,8 @@ class Gateway:
         app.router.add_get("/auth/callback", self.handle_auth_callback)
         app.router.add_get("/auth/logout", self.handle_auth_logout)
         app.router.add_get("/api/me", self.handle_api_me)
+        app.router.add_get("/api/files", self.handle_api_files)
+        app.router.add_get("/api/events", self.handle_api_events)
         app.router.add_get("/s/{name}", self.handle_site)
         app.router.add_get("/s/{name}/", self.handle_site)
         app.router.add_get("/s/{name}/{path:.*}", self.handle_site_path)
@@ -224,14 +227,72 @@ class Gateway:
                 "profile": profile,
                 "bots": [
                     {
+                        "id": b["id"],
                         "name": b["name"],
                         "status": b["status"],
+                        "runtime": b.get("runtime") or "python",
+                        "entry": b.get("entry") or "",
                         "site": bot_site_url(b["name"], request),
+                        "logs": self.cloud.get_logs(b["id"], 30),
                     }
                     for b in bots
                 ],
             }
         )
+
+    async def handle_api_files(self, request: web.Request) -> web.Response:
+        user = get_session_user(request)
+        if not user:
+            return web.json_response({"authenticated": False}, status=401)
+        owner_id = str(user["id"])
+        files = []
+        for bot in self.cloud.list(owner_id):
+            root = store.bot_dir(bot["id"], owner_id)
+            if not root.exists():
+                continue
+            for path in root.rglob("*"):
+                rel = path.relative_to(root)
+                if any(part.startswith(".") for part in rel.parts):
+                    continue
+                files.append({
+                    "botId": bot["id"],
+                    "path": rel.as_posix(),
+                    "directory": path.is_dir(),
+                    "size": path.stat().st_size if path.is_file() else None,
+                })
+        return web.json_response({"files": files})
+
+    async def handle_api_events(self, request: web.Request) -> web.StreamResponse:
+        user = get_session_user(request)
+        if not user:
+            return web.json_response({"authenticated": False}, status=401)
+        owner_id = str(user["id"])
+        websocket = web.WebSocketResponse(heartbeat=30)
+        await websocket.prepare(request)
+        queue = self.cloud.subscribe(owner_id)
+        try:
+            while not websocket.closed:
+                event_task = asyncio.create_task(queue.get())
+                receive_task = asyncio.create_task(websocket.receive())
+                done, pending = await asyncio.wait(
+                    (event_task, receive_task), return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                if receive_task in done and receive_task.result().type in {
+                    web.WSMsgType.CLOSE, web.WSMsgType.CLOSED, web.WSMsgType.ERROR
+                }:
+                    break
+                if event_task in done:
+                    await websocket.send_json(event_task.result())
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        finally:
+            self.cloud.unsubscribe(owner_id, queue)
+            await websocket.close()
+        return websocket
 
     def _find_bot(self, name: str) -> dict | None:
         return self.cloud.get(name)
