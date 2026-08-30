@@ -27,6 +27,17 @@ main { max-width: 920px; margin: 32px auto; padding: 0 20px 48px; }
 .off { color: #9aa0a6; }
 .user { display: flex; align-items: center; gap: 10px; }
 .user img { width: 36px; height: 36px; border-radius: 50%; }
+.file-toolbar, .file-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.file-toolbar select { margin-left: 6px; padding: 8px; color: inherit; background: #0f1115; border: 1px solid #3b414c; border-radius: 6px; }
+.file-drop { margin: 16px 0; padding: 20px; text-align: center; border: 2px dashed #3b414c; border-radius: 10px; color: #9aa0a6; }
+.file-drop.active { border-color: #5865f2; background: #20243b; }
+.file-workspace { display: grid; grid-template-columns: minmax(200px, 1fr) 2fr; gap: 16px; }
+.file-tree { min-height: 280px; max-height: 430px; overflow: auto; padding: 8px; background: #111318; border-radius: 8px; }
+.file-row { display: block; width: 100%; padding: 7px; color: inherit; background: transparent; border: 0; border-radius: 5px; text-align: left; cursor: pointer; }
+.file-row:hover:not(:disabled) { background: #2c313a; }.file-row:disabled { cursor: default; }
+.file-editor textarea { box-sizing: border-box; width: 100%; min-height: 330px; margin: 10px 0; padding: 12px; resize: vertical; color: #e8eaed; background: #0f1115; border: 1px solid #3b414c; border-radius: 8px; font: 13px ui-monospace, monospace; }
+.btn.danger { background: #da373c; }
+@media (max-width: 700px) { .file-workspace { grid-template-columns: 1fr; } }
 """
 
 

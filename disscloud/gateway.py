@@ -15,7 +15,7 @@ from .auth import (
     set_session_cookie,
     sync_user_from_discord,
 )
-from .cloud import Cloud
+from .cloud import Cloud, extract_zip_safe
 from .resources import dir_size, format_bytes, rss_of
 from .urls import bot_site_url, proxy_middleware, request_public_base
 from .web_ui import dashboard_page, landing_page, login_required_page, oauth_error_page
@@ -44,6 +44,39 @@ def safe_join(root: Path, rel: str) -> Path | None:
     except ValueError:
         return None
     return target
+
+
+SENSITIVE_NAMES = {".env", "cloud.log"}
+SENSITIVE_RE = re.compile(r"(?:token|secret|authorization|password)\s*[:=]", re.IGNORECASE)
+
+
+def bot_file_path(root: Path, rel: str, *, allow_root: bool = False) -> Path | None:
+    """Resolve an API path without permitting absolute paths or symlink escapes."""
+    if not isinstance(rel, str) or "\x00" in rel or Path(rel).is_absolute() or PureWindowsPath(rel).is_absolute():
+        return None
+    normalized = rel.replace("\\", "/")
+    if any(part in ("", ".", "..") for part in normalized.split("/")):
+        if not (allow_root and normalized in ("", ".")):
+            return None
+    target = safe_join(root, normalized)
+    if target is None or (not allow_root and target == root.resolve()):
+        return None
+    return target
+
+
+def is_sensitive_path(path: Path) -> bool:
+    name = path.name.lower()
+    return name in SENSITIVE_NAMES or "token" in name
+
+
+def contains_sensitive_value(path: Path) -> bool:
+    """Conservatively keep credential-looking text out of API responses."""
+    try:
+        if path.stat().st_size > config.MAX_UPLOAD_MB * 1024 * 1024:
+            return False
+        return bool(SENSITIVE_RE.search(path.read_text(encoding="utf-8")))
+    except (UnicodeDecodeError, OSError):
+        return False
 
 
 def escape_html(text: str) -> str:
@@ -239,6 +272,141 @@ class Gateway:
                 ],
             }
         )
+
+    def _owned_bot(self, request: web.Request) -> tuple[dict, Path] | web.Response:
+        user = get_session_user(request)
+        if not user:
+            return web.json_response({"error": "Discord login required"}, status=401)
+        bot = self.cloud.get(request.match_info["bot_id"])
+        if not bot:
+            return web.json_response({"error": "bot not found"}, status=404)
+        if str(bot.get("ownerId")) != str(user["id"]):
+            return web.json_response({"error": "forbidden"}, status=403)
+        return bot, store.bot_dir(bot["id"], bot["ownerId"])
+
+    async def handle_files_list(self, request: web.Request) -> web.Response:
+        owned = self._owned_bot(request)
+        if isinstance(owned, web.Response):
+            return owned
+        _bot, root = owned
+        files = []
+        if root.exists():
+            for path in sorted(root.rglob("*")):
+                resolved = safe_join(root, str(path.relative_to(root)))
+                if resolved is None or path.is_symlink():
+                    continue
+                rel = path.relative_to(root).as_posix()
+                files.append({"path": rel, "type": "directory" if path.is_dir() else "file", "size": path.stat().st_size if path.is_file() else 0})
+        return web.json_response({"files": files})
+
+    async def handle_files_upload(self, request: web.Request) -> web.Response:
+        owned = self._owned_bot(request)
+        if isinstance(owned, web.Response):
+            return owned
+        _bot, root = owned
+        limit = config.MAX_UPLOAD_MB * 1024 * 1024
+        if request.content_length is not None and request.content_length > limit + 65536:
+            return web.json_response({"error": f"upload limit is {config.MAX_UPLOAD_MB}MB"}, status=413)
+        try:
+            reader = await request.multipart()
+            field = await reader.next()
+        except (AssertionError, ValueError):
+            return web.json_response({"error": "multipart file required"}, status=400)
+        while field is not None and not field.filename:
+            field = await reader.next()
+        if field is None or not field.filename:
+            return web.json_response({"error": "file required"}, status=400)
+        filename = Path(field.filename).name
+        target_dir_rel = request.query.get("path", "")
+        target_dir = root if not target_dir_rel else bot_file_path(root, target_dir_rel)
+        if target_dir is None:
+            return web.json_response({"error": "invalid path"}, status=400)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=".upload-", dir=root)
+        os.close(fd)
+        temp = Path(temp_name)
+        size = 0
+        try:
+            with temp.open("wb") as output:
+                while chunk := await field.read_chunk():
+                    size += len(chunk)
+                    if size > limit:
+                        return web.json_response({"error": f"upload limit is {config.MAX_UPLOAD_MB}MB"}, status=413)
+                    output.write(chunk)
+            if filename.lower().endswith(".zip"):
+                with zipfile.ZipFile(temp) as archive:
+                    if any((info.external_attr >> 16) & 0o170000 == 0o120000 for info in archive.infolist()):
+                        return web.json_response({"error": "symbolic links are not allowed in zip files"}, status=400)
+                extract_zip_safe(temp, target_dir)
+            else:
+                target = bot_file_path(target_dir, filename)
+                if target is None:
+                    return web.json_response({"error": "invalid filename"}, status=400)
+                shutil.move(str(temp), target)
+            return web.json_response({"ok": True, "name": filename}, status=201)
+        except (OSError, ValueError, zipfile.BadZipFile) as err:
+            return web.json_response({"error": str(err)}, status=400)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    async def handle_file_get(self, request: web.Request) -> web.Response:
+        owned = self._owned_bot(request)
+        if isinstance(owned, web.Response):
+            return owned
+        _bot, root = owned
+        path = bot_file_path(root, request.match_info.get("path", ""))
+        if path is None:
+            return web.json_response({"error": "invalid path"}, status=400)
+        if not path.is_file():
+            return web.json_response({"error": "file not found"}, status=404)
+        if is_sensitive_path(path) or contains_sensitive_value(path):
+            return web.json_response({"error": "sensitive files cannot be downloaded"}, status=403)
+        if request.query.get("text") == "1":
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                return web.json_response({"error": "not a UTF-8 text file"}, status=415)
+            return web.json_response({"path": request.match_info["path"], "content": content})
+        return web.FileResponse(path, headers={"Content-Disposition": f'attachment; filename="{path.name}"', "Cache-Control": "no-store"})
+
+    async def handle_file_put(self, request: web.Request) -> web.Response:
+        owned = self._owned_bot(request)
+        if isinstance(owned, web.Response):
+            return owned
+        _bot, root = owned
+        path = bot_file_path(root, request.match_info.get("path", ""))
+        if path is None or is_sensitive_path(path):
+            return web.json_response({"error": "invalid or sensitive path"}, status=400)
+        if request.content_length is not None and request.content_length > config.MAX_UPLOAD_MB * 1024 * 1024:
+            return web.json_response({"error": "file too large"}, status=413)
+        try:
+            data = await request.json()
+            content = data["content"]
+            if not isinstance(content, str):
+                raise ValueError
+        except (ValueError, KeyError, TypeError):
+            return web.json_response({"error": "JSON string content required"}, status=400)
+        if len(content.encode("utf-8")) > config.MAX_UPLOAD_MB * 1024 * 1024:
+            return web.json_response({"error": "file too large"}, status=413)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return web.json_response({"ok": True})
+
+    async def handle_file_delete(self, request: web.Request) -> web.Response:
+        owned = self._owned_bot(request)
+        if isinstance(owned, web.Response):
+            return owned
+        _bot, root = owned
+        path = bot_file_path(root, request.match_info.get("path", ""))
+        if path is None:
+            return web.json_response({"error": "invalid path"}, status=400)
+        if not path.exists() or path.is_symlink():
+            return web.json_response({"error": "file not found"}, status=404)
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        return web.json_response({"ok": True})
 
     async def handle_api_files(self, request: web.Request) -> web.Response:
         user = get_session_user(request)
