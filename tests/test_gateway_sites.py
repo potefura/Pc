@@ -61,3 +61,23 @@ def test_unique_legacy_name_redirects_to_canonical_url():
             assert response.headers["Location"].endswith("/s/bot-one/unique/")
 
     asyncio.run(check())
+
+
+def test_canonical_url_serves_nested_static_file(tmp_path, monkeypatch):
+    bot = {"id": "bot-one", "ownerId": "owner-1", "name": "display-name", "status": "running"}
+    root = tmp_path / "owner-1" / "bot-one"
+    nested = root / "public" / "assets"
+    nested.mkdir(parents=True)
+    (nested / "app.js").write_text("console.log('ok')", encoding="utf-8")
+    monkeypatch.setattr(store, "bot_dir", lambda _bot_id, _owner_id: root)
+
+    async def check():
+        cloud = FakeCloud([bot])
+        async with TestClient(TestServer(Gateway(cloud).create_app())) as client:
+            response = await client.get("/s/bot-one/any-slug/assets/app.js")
+
+            assert response.status == 200
+            assert await response.text() == "console.log('ok')"
+            assert cloud.get_calls == ["bot-one"]
+
+    asyncio.run(check())

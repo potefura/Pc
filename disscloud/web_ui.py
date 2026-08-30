@@ -107,7 +107,7 @@ def dashboard_page(user: dict[str, Any], cloud: Cloud, profile: dict[str, Any]) 
     bot_rows = []
     secret_panels = []
     for bot in bots:
-        site = bot_site_url(bot["name"])
+        site = bot_site_url(bot["id"], bot["name"])
         status_cls = "ok" if bot["status"] == "running" else "off"
         status = "稼働中" if bot["status"] == "running" else "停止"
         bot_rows.append(

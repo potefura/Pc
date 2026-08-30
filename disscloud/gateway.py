@@ -2,7 +2,7 @@ import asyncio
 import html
 import mimetypes
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from aiohttp import web
 
@@ -170,9 +170,14 @@ class Gateway:
         app.router.add_get("/api/bots/{bot_id}/files/{path:.*}", self.handle_file_get)
         app.router.add_put("/api/bots/{bot_id}/files/{path:.*}", self.handle_file_put)
         app.router.add_delete("/api/bots/{bot_id}/files/{path:.*}", self.handle_file_delete)
-        app.router.add_get("/s/{name}", self.handle_site)
-        app.router.add_get("/s/{name}/", self.handle_site)
-        app.router.add_get("/s/{name}/{path:.*}", self.handle_site_path)
+        # Register canonical ID-based URLs before the legacy name-only route.
+        # The slug is descriptive; only bot_id selects the site to serve.
+        app.router.add_get("/s/{bot_id}/{slug}", self.handle_site)
+        app.router.add_get("/s/{bot_id}/{slug}/", self.handle_site)
+        app.router.add_get("/s/{bot_id}/{slug}/{path:.*}", self.handle_site_path)
+        app.router.add_get("/s/{name}", self.handle_legacy_site)
+        app.router.add_get("/s/{name}/", self.handle_legacy_site)
+        return app
 
     async def start(self) -> None:
         app = self.create_app()
@@ -353,7 +358,7 @@ class Gateway:
         rel = request.match_info.get("path", "").strip("/")
         if not rel or is_reserved_file_path(rel):
             raise web.HTTPForbidden(text="reserved path")
-        target = safe_join(store.bot_dir(bot["id"], bot["ownerId"]), rel)
+        target = bot_file_path(store.bot_dir(bot["id"], bot["ownerId"]), rel)
         if target is None:
             raise web.HTTPForbidden(text="invalid path")
         return target
