@@ -1,5 +1,5 @@
 import json
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from aiohttp import web
 
@@ -47,8 +47,16 @@ def public_base_url(request: web.Request | None = None) -> str:
     return f"http://localhost:{config.SITE_PORT}"
 
 
-def bot_site_url(bot_name: str, request: web.Request | None = None) -> str:
-    return f"{public_base_url(request)}/s/{bot_name}/"
+def bot_site_url(
+    bot_id: str,
+    slug: str,
+    request: web.Request | None = None,
+    *,
+    base_url: str | None = None,
+) -> str:
+    """Return the canonical site URL; the slug is descriptive, not an identifier."""
+    base = (base_url or public_base_url(request)).rstrip("/")
+    return f"{base}/s/{quote(str(bot_id), safe='')}/{quote(str(slug), safe='')}/"
 
 
 def is_cloudflare_request(request: web.Request) -> bool:

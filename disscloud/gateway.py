@@ -1,3 +1,4 @@
+import asyncio
 import html
 import mimetypes
 from pathlib import Path
@@ -14,7 +15,7 @@ from .auth import (
     set_session_cookie,
     sync_user_from_discord,
 )
-from .cloud import Cloud
+from .cloud import Cloud, extract_zip_safe
 from .resources import dir_size, format_bytes, rss_of
 from .urls import bot_site_url, proxy_middleware, request_public_base
 from .web_ui import dashboard_page, landing_page, login_required_page, oauth_error_page
@@ -43,6 +44,39 @@ def safe_join(root: Path, rel: str) -> Path | None:
     except ValueError:
         return None
     return target
+
+
+SENSITIVE_NAMES = {".env", "cloud.log"}
+SENSITIVE_RE = re.compile(r"(?:token|secret|authorization|password)\s*[:=]", re.IGNORECASE)
+
+
+def bot_file_path(root: Path, rel: str, *, allow_root: bool = False) -> Path | None:
+    """Resolve an API path without permitting absolute paths or symlink escapes."""
+    if not isinstance(rel, str) or "\x00" in rel or Path(rel).is_absolute() or PureWindowsPath(rel).is_absolute():
+        return None
+    normalized = rel.replace("\\", "/")
+    if any(part in ("", ".", "..") for part in normalized.split("/")):
+        if not (allow_root and normalized in ("", ".")):
+            return None
+    target = safe_join(root, normalized)
+    if target is None or (not allow_root and target == root.resolve()):
+        return None
+    return target
+
+
+def is_sensitive_path(path: Path) -> bool:
+    name = path.name.lower()
+    return name in SENSITIVE_NAMES or "token" in name
+
+
+def contains_sensitive_value(path: Path) -> bool:
+    """Conservatively keep credential-looking text out of API responses."""
+    try:
+        if path.stat().st_size > config.MAX_UPLOAD_MB * 1024 * 1024:
+            return False
+        return bool(SENSITIVE_RE.search(path.read_text(encoding="utf-8")))
+    except (UnicodeDecodeError, OSError):
+        return False
 
 
 def escape_html(text: str) -> str:
@@ -101,7 +135,7 @@ class Gateway:
         self.cloud = cloud
         self.runner: web.AppRunner | None = None
 
-    async def start(self) -> None:
+    def create_app(self) -> web.Application:
         app = web.Application(middlewares=[proxy_middleware])
         app["oauth_states"] = {}
 
@@ -111,10 +145,16 @@ class Gateway:
         app.router.add_get("/auth/callback", self.handle_auth_callback)
         app.router.add_get("/auth/logout", self.handle_auth_logout)
         app.router.add_get("/api/me", self.handle_api_me)
-        app.router.add_get("/s/{name}", self.handle_site)
-        app.router.add_get("/s/{name}/", self.handle_site)
-        app.router.add_get("/s/{name}/{path:.*}", self.handle_site_path)
+        # Canonical ID routes must precede the overlapping legacy name route.
+        app.router.add_get("/s/{bot_id}/{slug}", self.handle_site)
+        app.router.add_get("/s/{bot_id}/{slug}/", self.handle_site)
+        app.router.add_get("/s/{bot_id}/{slug}/{path:.*}", self.handle_site_path)
+        app.router.add_get("/s/{name}", self.handle_legacy_site)
+        app.router.add_get("/s/{name}/", self.handle_legacy_site)
+        return app
 
+    async def start(self) -> None:
+        app = self.create_app()
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, config.SITE_HOST, config.SITE_PORT)
@@ -128,7 +168,7 @@ class Gateway:
             mode.append("Proxy")
         mode_text = f" [{', '.join(mode)}]" if mode else ""
         print(f"サイトゲートウェイ: ローカル {config.SITE_HOST}:{config.SITE_PORT}")
-        print(f"公開 URL{mode_text}: {public}  （各BOTは {public}/s/<名前>/ ）")
+        print(f"公開 URL{mode_text}: {public}  （各BOTは {public}/s/<BOT ID>/<名前>/ ）")
         if oauth_enabled():
             from .auth import oauth_redirect_uri
 
@@ -224,40 +264,54 @@ class Gateway:
                 "profile": profile,
                 "bots": [
                     {
+                        "id": b["id"],
                         "name": b["name"],
                         "status": b["status"],
-                        "site": bot_site_url(b["name"], request),
+                        "site": bot_site_url(b["id"], b["name"], request),
                     }
                     for b in bots
                 ],
             }
         )
 
-    def _find_bot(self, name: str) -> dict | None:
-        return self.cloud.get(name)
+    def _find_bot(self, bot_id: str) -> dict | None:
+        bot = self.cloud.get(bot_id)
+        return bot if bot and bot["id"] == bot_id else None
 
     async def handle_site(self, request: web.Request) -> web.Response:
-        return await self._serve_bot(request, request.match_info["name"], "index.html")
+        return await self._serve_bot(request, request.match_info["bot_id"], "index.html")
 
     async def handle_site_path(self, request: web.Request) -> web.Response:
         path = request.match_info.get("path", "") or "index.html"
-        return await self._serve_bot(request, request.match_info["name"], path)
+        return await self._serve_bot(request, request.match_info["bot_id"], path)
 
-    async def _serve_bot(self, request: web.Request, name: str, path: str) -> web.Response:
-        bot = self._find_bot(name)
+    async def handle_legacy_site(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        matches = [bot for bot in self.cloud.list() if bot["name"].lower() == name.lower()]
+        if len(matches) != 1:
+            return web.Response(text="site not found", status=404, content_type="text/plain", charset="utf-8")
+        bot = matches[0]
+        raise web.HTTPFound(bot_site_url(bot["id"], bot["name"], request))
+
+    async def _serve_bot(self, request: web.Request, bot_id: str, path: str) -> web.Response:
+        bot = self._find_bot(bot_id)
         if not bot:
-            return web.Response(text="site not found", status=404, content_type="text/plain; charset=utf-8")
+            return web.Response(text="site not found", status=404, content_type="text/plain", charset="utf-8")
 
         static_file = try_static(bot["id"], bot["ownerId"], path)
         if static_file:
             ext = static_file.suffix.lower()
             content_type = MIME_OVERRIDES.get(ext) or mimetypes.guess_type(str(static_file))[0] or "application/octet-stream"
-            return web.FileResponse(static_file, headers={"Cache-Control": "no-store"}, content_type=content_type)
+            return web.FileResponse(
+                static_file,
+                headers={"Cache-Control": "no-store", "Content-Type": content_type},
+            )
 
         disk = format_bytes(dir_size(store.bot_dir(bot["id"], bot["ownerId"])))
         mem = format_bytes(rss_of(bot.get("pid")))
-        site_url = bot_site_url(bot["name"], request)
+        site_url = bot_site_url(bot["id"], bot["name"], request)
         return web.Response(
             text=status_html(bot, disk, mem, site_url),
-            content_type="text/html; charset=utf-8",
+            content_type="text/html",
+            charset="utf-8",
         )
